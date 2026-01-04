@@ -38,31 +38,6 @@ class GeoNT(nn.Module):
         self.motion_patch_embed = PatchEmbed(in_chans=5, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
         self.cam_dec = CameraDec(dim_in=1536)
 
-    def normalize_depth(self, depth, mask, eps=1e-8):
-        """
-        depth: [B,H,W]
-        mask:  [B,H,W]
-        """
-        assert depth.shape == mask.shape, "mask and depth must have the same dimensions"
-
-        scaled_depth = torch.zeros_like(depth)
-        scale = depth.new_zeros((depth.shape[0],))
-        # invalid depth to zeros, required for MoGE
-        depth[~mask] = 0
-        for b in range(depth.shape[0]):
-            valid = depth[b][mask[b]]
-            if valid.numel() == 0:
-                continue
-
-            mean = valid.mean() + eps
-            depth_b = depth[b] / mean
-            scaled_depth[b] = depth_b * mask[b]
-            scale[b] = mean
-
-        scale[scale==0] = scale[scale>0].mean()
-
-        return scaled_depth, scale
-
     def forward(
         self, 
         flow_predictions, 
@@ -99,8 +74,7 @@ class GeoNT(nn.Module):
         depth = depth_predictions['depth']
         mask = depth_predictions['mask']
         assert depth.ndim == 2
-        scaled_depth, scale = self.normalize_depth(depth[None].clone(), mask[None])
-        depthmap = torch.stack([scaled_depth, mask[None].to(scaled_depth.dtype)], dim=1)
+        depthmap = torch.stack([depth, mask.to(depth.dtype)], dim=0)[None]
         depth_token = self.depth_patch_embed(depthmap)
 
         # expand the edge size
@@ -117,13 +91,13 @@ class GeoNT(nn.Module):
             depth, depth_conf = self.depth_head(
                 feats, H=ht, W=wd, patch_start_idx=0
             )
-            depth = depth.squeeze(0) * scale[:, None, None]
+            depth = depth.squeeze(0)
             depth_conf = depth_conf.squeeze(0)
-            pose_enc = self.cam_dec(feats[-1][1], scale[None]).squeeze(0)
+            pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)
             depth = (depth * depth_conf).sum(dim=0) / (depth_conf.sum(dim=0) + 1e-8)
 
         output = {
-            "depth": depth,  # E,H,W
+            "depth": depth,  # H,W
             "pose_enc": pose_enc,  # E,7
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
@@ -165,6 +139,31 @@ class GeoNTWrapper(nn.Module):
     
     def load_state_dict(self, state_dict, strict=True, assign=False):
         return self.model.load_state_dict(state_dict, strict, assign)
+    
+    def normalize_depth(self, depth, mask, eps=1e-8):
+        """
+        depth: [B,H,W]
+        mask:  [B,H,W]
+        """
+        assert depth.shape == mask.shape, "mask and depth must have the same dimensions"
+
+        scaled_depth = torch.zeros_like(depth)
+        scale = depth.new_zeros((depth.shape[0],))
+        # invalid depth to zeros, required for MoGE
+        depth[~mask] = 0
+        for b in range(depth.shape[0]):
+            valid = depth[b][mask[b]]
+            if valid.numel() == 0:
+                continue
+
+            mean = valid.mean() + eps
+            depth_b = depth[b] / mean
+            scaled_depth[b] = depth_b
+            scale[b] = mean
+
+        scale[scale==0] = scale[scale>0].mean()
+
+        return scaled_depth, scale
     
     def forward(self, images, intrinsics, graph, gt_depths, gt_depths_valid, gt_pose, use_fp16=False):
 
@@ -222,6 +221,7 @@ class GeoNTWrapper(nn.Module):
         fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
         depth_predictions = self.mono.infer(images[0] / 255.0, fov_x=fov_x)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
+        scaled_depth, scale = self.normalize_depth(mono_depths.clone(), valid)
 
         iu = torch.unique(ii)
         for fi in iu:
@@ -233,7 +233,7 @@ class GeoNTWrapper(nn.Module):
                 "info": info[mask],
             }
             depth_predictions = {
-                "depth": mono_depths[fi],
+                "depth": scaled_depth[fi],
                 "mask": valid[fi],
             }
 
@@ -254,6 +254,7 @@ class GeoNTWrapper(nn.Module):
             "valid": valid[None],
             "flow": flow_final,
             "info": info,
+            "scale": scale[None],  # (B,S)
         }
 
         return predictions

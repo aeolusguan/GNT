@@ -29,11 +29,11 @@ class CameraDec(nn.Module):
         self.fc_t = nn.Linear(output_dim, 3)
         self.fc_qvec = nn.Linear(output_dim, 4)
 
-    def forward(self, feat, scale, camera_encoding=None, *args, **kwargs):
+    def forward(self, feat, camera_encoding=None, *args, **kwargs):
         B, N = feat.shape[:2]
         feat = feat.reshape(B * N, -1)
         feat = self.backbone(feat)
-        out_t = self.fc_t(feat.float()).reshape(B, N, 3) * scale[:, :, None]
+        out_t = self.fc_t(feat.float()).reshape(B, N, 3)
         if camera_encoding is None:
             out_qvec = self.fc_qvec(feat.float()).reshape(B, N, 4)
         else:

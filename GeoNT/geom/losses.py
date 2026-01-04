@@ -16,7 +16,7 @@ def pose_metrics(dE):
     return r_err, t_err, s_err
 
 
-def geodesic_loss(gt_pose, pose_est, graph, pr_scale, gt_scale):
+def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
     """ Loss function for training network """
 
     # relative pose
