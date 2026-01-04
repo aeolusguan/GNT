@@ -1,0 +1,455 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+
+# Inspired by https://github.com/DepthAnything/Depth-Anything-V2
+
+
+import os
+from typing import List, Dict, Tuple, Union
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .utils import create_uv_grid, position_grid_to_embed
+
+
+class DPTHead(nn.Module):
+    """
+    DPT  Head for dense prediction tasks.
+
+    This implementation follows the architecture described in "Vision Transformers for Dense Prediction"
+    (https://arxiv.org/abs/2103.13413). The DPT head processes features from a vision transformer
+    backbone and produces dense predictions by fusing multi-scale features.
+
+    Args:
+        dim_in (int): Input dimension (channels).
+        patch_size (int, optional): Patch size. Default is 14.
+        output_dim (int, optional): Number of output channels. Default is 4.
+        activation (str, optional): Activation type. Default is "inv_log".
+        conf_activation (str, optional): Confidence activation type. Default is "expp1".
+        features (int, optional): Feature channels for intermediate representations. Default is 256.
+        out_channels (List[int], optional): Output channels for each intermediate layer.
+        intermediate_layer_idx (List[int], optional): Indices of layers from aggregated tokens used for DPT.
+        pos_embed (bool, optional): Whether to use positional embedding. Default is True.
+        down_ratio (int, optional): Downscaling factor for the output resolution. Default is 1.
+    """
+    def __init__(
+        self,
+        dim_in: int,
+        patch_size: int = 14,
+        output_dim: int = 4,
+        activation: str = "inv_log",
+        conf_activation: str = "expp1",
+        features: int = 256,
+        out_channels: List[int] = [256, 512, 1024, 1024],
+        pos_embed: bool = True,
+        down_ratio: int = 1,
+    ) -> None:
+        super(DPTHead, self).__init__()
+        self.patch_size = patch_size
+        self.activation = activation
+        self.conf_activation = conf_activation
+        self.pos_embed = pos_embed
+        self.down_ratio = down_ratio
+
+        # Always expect 4 scales; enforce intermediate idx = (0, 1, 2, 3)
+        self.intermediate_layer_idx: Tuple[int, int, int, int] = (0, 1, 2, 3)
+
+        self.norm = nn.LayerNorm(dim_in)
+
+        # Projection layers for each output channel from tokens.
+        self.projects = nn.ModuleList(
+            [
+                nn.Conv2d(
+                    in_channels=dim_in,
+                    out_channels=oc,
+                    kernel_size=1,
+                    stride=1,
+                    padding=0,
+                )
+                for oc in out_channels
+            ]
+        )
+
+        # Resize layers for upsampling feature maps.
+        self.resize_layers = nn.ModuleList(
+            [
+                nn.ConvTranspose2d(
+                    in_channels=out_channels[0], out_channels=out_channels[0], kernel_size=4, stride=4, padding=0
+                ),
+                nn.ConvTranspose2d(
+                    in_channels=out_channels[1], out_channels=out_channels[1], kernel_size=2, stride=2, padding=0
+                ),
+                nn.Identity(),
+                nn.Conv2d(
+                    in_channels=out_channels[3], out_channels=out_channels[3], kernel_size=3, stride=2, padding=1
+                ),
+            ]
+        )
+
+        self.scratch = _make_scratch(
+            out_channels,
+            features,
+            expand=False,
+        )
+
+        # Attach additional modules to scratch.
+        self.scratch.stem_transpose = None
+        self.scratch.refinenet1 = _make_fusion_block(features)
+        self.scratch.refinenet2 = _make_fusion_block(features)
+        self.scratch.refinenet3 = _make_fusion_block(features)
+        self.scratch.refinenet4 = _make_fusion_block(features, has_residual=False)
+
+        head_features_1 = features
+        head_features_2 = 32
+
+        self.scratch.output_conv1 = nn.Conv2d(
+            head_features_1, head_features_1 // 2, kernel_size=3, stride=1, padding=1
+        )
+        self.scratch.output_conv2 = nn.Sequential(
+            nn.Conv2d(head_features_1 // 2, head_features_2, kernel_size=3, stride=1, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
+        )
+
+    def forward(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        H: int,
+        W: int,
+        patch_start_idx: int,
+        chunk_size: int = 8,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """ 
+        Forward pass through the DPT head, supports processing by chunking frames.
+        Args:
+            aggregated_tokens_list (List[Tensor]): List of 4 tensors [B, S, T, C] from transformer.
+            images (Tensor): Input images with shape [B, S, 3, H, W], in range [0, 1].
+            patch_start_idx (int): Starting index for patch tokens in the token sequence.
+                Used to separate patch tokens from other tokens (e.g., camera or register tokens).
+            frames_chunk_size (int, optional): Number of frames to process in each chunk.
+                If None or larger than S, all frames are processed at once. Default: 8.
+
+        Returns:
+            Tensor or Tuple[Tensor, Tensor]:
+                - If feature_only=True: Feature maps with shape [B, S, C, H, W]
+                - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
+        """
+        B, S, N, C = aggregated_tokens_list[0][0].shape
+        feats = [feat[0].reshape(B * S, N, C) for feat in aggregated_tokens_list]
+        if chunk_size is None or chunk_size >= S:
+            preds, conf = self._forward_impl(feats, H, W, patch_start_idx)
+            return preds.reshape(B, S, *preds.shape[1:]), conf.reshape(B, S, *conf.shape[1:])
+        preds, conf = [], []
+        for s0 in range(0, B * S, chunk_size):
+            s1 = min(s0 + chunk_size, B * S)
+            preds_slice, conf_slice = self._forward_impl(
+                [feat[s0:s1] for feat in feats],
+                H,
+                W,
+                patch_start_idx,
+            )
+            preds.append(preds_slice)
+            conf.append(conf_slice)
+        return torch.cat(preds, dim=0).reshape(B, S, *preds[0].shape[1:]), torch.cat(conf, dim=0).reshape(B, S, *conf[0].shape[1:])
+
+    def _forward_impl(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        H: int,
+        W: int,
+        patch_start_idx: int,
+    ) -> Dict[str, torch.Tensor]:
+        B, _, C = aggregated_tokens_list[0].shape
+        ph, pw = H // self.patch_size, W // self.patch_size
+        resized_feats = []
+        for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
+            x = aggregated_tokens_list[take_idx][:, patch_start_idx:]
+            x = self.norm(x)
+            x = x.permute(0, 2, 1).reshape(B, C, ph, pw)  # [B*S, C, ph, pw]
+
+            x = self.projects[stage_idx](x)
+            if self.pos_embed:
+                x = self._add_pos_embed(x, W, H)
+            x = self.resize_layers[stage_idx](x)  # align scales
+            resized_feats.append(x)
+
+        # Fuse features from multiple layers.
+        out = self.scratch_forward(resized_feats)
+        # Upsample to target resolution and (optional) add pos-embed again
+        h_out = int(ph * self.patch_size / self.down_ratio)
+        w_out = int(pw * self.patch_size / self.down_ratio)
+        out = custom_interpolate(
+            out, (h_out, w_out), mode="bilinear", align_corners=True
+        )
+
+        if self.pos_embed:
+            out = self._add_pos_embed(out, W, H)
+
+        out = self.scratch.output_conv2(out)
+        out = out.permute(0, 2, 3, 1)
+        preds = self._apply_activation_single(out[..., :-1], self.activation)
+        conf = self._apply_activation_single(out[..., -1], self.conf_activation)
+        return preds.squeeze(-1), conf
+
+    def _add_pos_embed(self, x: torch.Tensor, W: int, H: int, ratio: float = 0.1) -> torch.Tensor:
+        """Simple UV positional embedding added to feature maps."""
+        pw, ph = x.shape[-1], x.shape[-2]
+        pe = create_uv_grid(pw, ph, aspect_ratio=W / H, dtype=x.dtype, device=x.device)
+        pe = position_grid_to_embed(pe, x.shape[1]) * ratio
+        pe = pe.permute(2, 0, 1)[None].expand(x.shape[0], -1, -1, -1)
+        return x + pe
+    
+    def scratch_forward(self, features: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Forward pass through the fusion blocks.
+        
+        Args:
+            features (List[Tensor]): List of feature maps from different layers.
+
+        Returns:
+            Tensor: Fused feature map.
+        """
+        layer_1, layer_2, layer_3, layer_4 = features
+
+        layer_1_rn = self.scratch.layer1_rn(layer_1)
+        layer_2_rn = self.scratch.layer2_rn(layer_2)
+        layer_3_rn = self.scratch.layer3_rn(layer_3)
+        layer_4_rn = self.scratch.layer4_rn(layer_4)
+
+        out = self.scratch.refinenet4(layer_4_rn, size=layer_3_rn.shape[2:])
+        del layer_4_rn, layer_4
+
+        out = self.scratch.refinenet3(out, layer_3_rn, size=layer_2_rn.shape[2:])
+        del layer_3_rn, layer_3
+
+        out = self.scratch.refinenet2(out, layer_2_rn, size=layer_1_rn.shape[2:])
+        del layer_2_rn, layer_2
+
+        out = self.scratch.refinenet1(out, layer_1_rn)
+        del layer_1_rn, layer_1
+
+        out = self.scratch.output_conv1(out)
+        return out
+    
+    def _apply_activation_single(
+        self, x: torch.Tensor, activation: str = "linear"
+    ) -> torch.Tensor:
+        """
+        Apply activation to single channel output, maintaining semantic consistency with value branch in multi-channel case.
+        Supports: exp / relu / sigmoid / softplus / tanh / linear / expp1
+        """
+        act = activation.lower() if isinstance(activation, str) else activation
+        if act == "exp":
+            return torch.exp(x)
+        if act == "expm1":
+            return torch.expm1(x)
+        if act == "expp1":
+            return torch.exp(x) + 1
+        if act == "relu":
+            return torch.relu(x)
+        if act == "sigmoid":
+            return torch.sigmoid(x)
+        if act == "softplus":
+            return torch.nn.functional.softplus(x)
+        if act == "tanh":
+            return torch.tanh(x)
+        # Default linear
+        return x
+
+
+################################################################################
+# Modules
+################################################################################
+
+
+def _make_fusion_block(features: int, size: int = None, has_residual: bool = True, groups: int = 1) -> nn.Module:
+    return FeatureFusionBlock(
+        features,
+        nn.ReLU(inplace=True),
+        deconv=False,
+        bn=False,
+        expand=False,
+        align_corners=True,
+        size=size,
+        has_residual=has_residual,
+        groups=groups,
+    )
+
+
+def _make_scratch(in_shape: List[int], out_shape: int, groups: int = 1, expand: bool = False) -> nn.Module:
+    scratch = nn.Module()
+    out_shape1 = out_shape
+    out_shape2 = out_shape
+    out_shape3 = out_shape
+    if len(in_shape) >= 4:
+        out_shape4 = out_shape
+
+    if expand:
+        out_shape1 = out_shape
+        out_shape2 = out_shape * 2
+        out_shape3 = out_shape * 4
+        if len(in_shape) >= 4:
+            out_shape4 = out_shape * 8
+
+    scratch.layer1_rn = nn.Conv2d(
+        in_shape[0], out_shape1, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    scratch.layer2_rn = nn.Conv2d(
+        in_shape[1], out_shape2, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    scratch.layer3_rn = nn.Conv2d(
+        in_shape[2], out_shape3, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+    )
+    if len(in_shape) >= 4:
+        scratch.layer4_rn = nn.Conv2d(
+            in_shape[3], out_shape4, kernel_size=3, stride=1, padding=1, bias=False, groups=groups
+        )
+    return scratch
+
+
+class ResidualConvUnit(nn.Module):
+    """Residual convolution module."""
+
+    def __init__(self, features, activation, bn, groups=1):
+        """Init.
+
+        Args:
+            features (int): number of features
+        """
+        super().__init__()
+
+        self.bn = bn
+        self.groups = groups
+        self.conv1 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups)
+        self.conv2 = nn.Conv2d(features, features, kernel_size=3, stride=1, padding=1, bias=True, groups=self.groups)
+
+        self.norm1 = None
+        self.norm2 = None
+
+        self.activation = activation
+        self.skip_add = nn.quantized.FloatFunctional()
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (tensor): input
+
+        Returns:
+            tensor: output
+        """
+
+        out = self.activation(x)
+        out = self.conv1(out)
+        if self.norm1 is not None:
+            out = self.norm1(out)
+
+        out = self.activation(out)
+        out = self.conv2(out)
+        if self.norm2 is not None:
+            out = self.norm2(out)
+
+        return self.skip_add.add(out, x)
+    
+
+class FeatureFusionBlock(nn.Module):
+    """Feature fusion block."""
+
+    def __init__(
+        self,
+        features,
+        activation,
+        deconv=False,
+        bn=False,
+        expand=False,
+        align_corners=True,
+        size=None,
+        has_residual=True,
+        groups=1,
+    ):
+        """Init.
+        
+        Args:
+            features (int): number of features
+        """
+        super(FeatureFusionBlock, self).__init__()
+
+        self.deconv = deconv
+        self.align_corners = align_corners
+        self.groups = groups
+        self.expand = expand
+        out_features = features
+        if self.expand == True:
+            out_features = features // 2
+        
+        self.out_conv = nn.Conv2d(
+            features, out_features, kernel_size=1, stride=1, padding=0, bias=True, groups=self.groups
+        )
+
+        if has_residual:
+            self.resConfUnit1 = ResidualConvUnit(features, activation, bn, groups=self.groups)
+
+        self.has_residual = has_residual
+        self.resConfUnit2 = ResidualConvUnit(features, activation, bn, groups=self.groups)
+
+        self.skip_add = nn.quantized.FloatFunctional()
+        self.size = size
+
+    def forward(self, *xs, size=None):
+        """Forward pass.
+
+        Returns:
+            tensor: output
+        """
+        output = xs[0]
+
+        if self.has_residual:
+            res = self.resConfUnit1(xs[1])
+            output = self.skip_add.add(output, res)
+
+        output = self.resConfUnit2(output)
+
+        if (size is None) and (self.size is None):
+            modifier = {"scale_factor": 2}
+        elif size is None:
+            modifier = {"size": self.size}
+        else:
+            modifier = {"size": size}
+
+        output = custom_interpolate(output, **modifier, mode="bilinear", align_corners=self.align_corners)
+        output = self.out_conv(output)
+
+        return output
+    
+
+def custom_interpolate(
+    x: torch.Tensor,
+    size: Tuple[int, int] = None,
+    scale_factor: float = None,
+    mode: str = "bilinear",
+    align_corners: bool = True,
+) -> torch.Tensor:
+    """
+    Custom interpolate to avoid INT_MAX issues in nn.functional.interpolate.
+    """
+    if size is None:
+        size = (int(x.shape[-2] * scale_factor), int(x.shape[-1] * scale_factor))
+
+    INT_MAX = 1610612736
+
+    input_elements = size[0] * size[1] * x.shape[0] * x.shape[1]
+
+    if input_elements > INT_MAX:
+        chunks = torch.chunk(x, chunks=(input_elements // INT_MAX) + 1, dim=0)
+        interpolated_chunks = [
+            nn.functional.interpolate(chunk, size=size, mode=mode, align_corners=align_corners) for chunk in chunks
+        ]
+        x = torch.cat(interpolated_chunks, dim=0)
+        return x.contiguous()
+    else:
+        return nn.functional.interpolate(x, size=size, mode=mode, align_corners=align_corners)

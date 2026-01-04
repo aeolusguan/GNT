@@ -1,0 +1,20 @@
+.idea/
+.vscode/
+
+# byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pickle
+
+# dataset and checkpoint directory
+checkpoints/
+datasets/
+
+# distribution / packaging
+build/
+dist/
+*.egg-info/
