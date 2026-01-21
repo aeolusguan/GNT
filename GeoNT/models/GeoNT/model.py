@@ -94,7 +94,6 @@ class GeoNT(nn.Module):
             depth = depth.squeeze(0)
             depth_conf = depth_conf.squeeze(0)
             pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)
-            depth = (depth * depth_conf).sum(dim=0) / (depth_conf.sum(dim=0) + 1e-8)
 
         output = {
             "depth": depth,  # H,W

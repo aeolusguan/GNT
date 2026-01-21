@@ -108,7 +108,7 @@ def train(args):
 
     # auto resume if not specified
     if args.resume is None:
-        last_ckpt_fname = os.path.join(args.output_dir, f'checkpoint_last.pth')
+        last_ckpt_fname = os.path.join(args.output_dir, f'checkpoint-last.pth')
         args.resume = last_ckpt_fname if os.path.isfile(last_ckpt_fname) else None
 
     print('job dir: {}'.format(os.path.dirname(os.path.realpath(__file__))))

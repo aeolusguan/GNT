@@ -116,6 +116,13 @@ class DPTHead(nn.Module):
             nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
         )
 
+        self.gates = nn.ModuleList(
+            [
+                nn.Linear(dim_in, 1)
+                for _ in range(4)
+            ]
+        )
+
     def forward(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -140,13 +147,14 @@ class DPTHead(nn.Module):
                 - Otherwise: Tuple of (predictions, confidence) both with shape [B, S, 1, H, W]
         """
         B, S, N, C = aggregated_tokens_list[0][0].shape
-        feats = [feat[0].reshape(B * S, N, C) for feat in aggregated_tokens_list]
-        if chunk_size is None or chunk_size >= S:
+        gates = [torch.softmax(gate(feat[0]), dim=1) for feat, gate in zip(aggregated_tokens_list, self.gates)]
+        feats = [(feat[0] * gate).sum(dim=1) for feat, gate in zip(aggregated_tokens_list, gates)]
+        if chunk_size is None or chunk_size >= B:
             preds, conf = self._forward_impl(feats, H, W, patch_start_idx)
-            return preds.reshape(B, S, *preds.shape[1:]), conf.reshape(B, S, *conf.shape[1:])
+            return preds, conf
         preds, conf = [], []
-        for s0 in range(0, B * S, chunk_size):
-            s1 = min(s0 + chunk_size, B * S)
+        for s0 in range(0, B, chunk_size):
+            s1 = min(s0 + chunk_size, B)
             preds_slice, conf_slice = self._forward_impl(
                 [feat[s0:s1] for feat in feats],
                 H,
@@ -155,7 +163,7 @@ class DPTHead(nn.Module):
             )
             preds.append(preds_slice)
             conf.append(conf_slice)
-        return torch.cat(preds, dim=0).reshape(B, S, *preds[0].shape[1:]), torch.cat(conf, dim=0).reshape(B, S, *conf[0].shape[1:])
+        return torch.cat(preds, dim=0), torch.cat(conf, dim=0)
 
     def _forward_impl(
         self,
@@ -170,7 +178,7 @@ class DPTHead(nn.Module):
         for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
             x = aggregated_tokens_list[take_idx][:, patch_start_idx:]
             x = self.norm(x)
-            x = x.permute(0, 2, 1).reshape(B, C, ph, pw)  # [B*S, C, ph, pw]
+            x = x.permute(0, 2, 1).reshape(B, C, ph, pw)  # [B, C, ph, pw]
 
             x = self.projects[stage_idx](x)
             if self.pos_embed:

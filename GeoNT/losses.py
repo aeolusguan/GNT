@@ -115,7 +115,7 @@ class MultitaskLoss(torch.nn.Module):
         Returns:
             Dict containing individual losses and total objective
         """
-        pr_depth = predictions["depth"]
+        pr_depth = predictions["depth"].clip(max=100, min=1e-3)
         gt_depth = batch["depth"]
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
 
@@ -133,8 +133,10 @@ class MultitaskLoss(torch.nn.Module):
         intrinsics = batch["intrinsics"]
 
         cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale)
+        cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
         # cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale)
         flo_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
+        flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
 
         # ii, jj, kk = graph_to_edge_list(graph)
         # coords0, val0 = projective_transform(gt_pose, 1.0 / gt_depth, intrinsics, ii, jj)
@@ -172,9 +174,14 @@ class MultitaskLoss(torch.nn.Module):
             valid_mask.flatten(0, 1),
             gradient_loss_fn=gradient_loss,
         )
+        depth_grad_loss = check_and_fix_inf_nan(depth_grad_loss, "depth_grad_loss")
 
         depth_loss = depth_grad_loss + depth_reg_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
+
+        assert not torch.any(torch.isnan(cam_loss))
+        assert not torch.any(torch.isnan(flo_loss))
+        assert not torch.any(torch.isnan(depth_loss))
 
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
