@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .dinov2.dinov2 import DinoV2
 from .dinov2.layers import PatchEmbed
@@ -10,6 +11,40 @@ from GeoNT.geom.graph_utils import graph_to_edge_list, keyframe_indices
 from ..external import load_moge, load_raft
 from GeoNT.geom.projective_ops import projective_transform
 from lietorch import SE3
+
+
+def flow_jacobian(flow):
+    """
+    Compute spatial Jacobian of optical flow.
+
+    Args:
+        flow: (B, 2, H, W) tensor, flow in normalized coordinates
+
+    Returns:
+        jacobian: (b, 4, H, W) tensor
+                  channels = [dfx_dx, dfx_dy, dfy_dx, dfy_dy]
+    """
+
+    dx = flow[:, 0:1]
+    dy = flow[:, 1:2]
+
+    # Pad for central differences
+    dx_pad = F.pad(dx, (1, 1, 1, 1), mode="replicate")
+    dy_pad = F.pad(dy, (1, 1, 1, 1), mode="replicate")
+
+    # Central differences
+    dfx_dx = (dx_pad[:, :, 1:-1, 2:] - dx_pad[:, :, 1:-1, :-2]) * 0.5
+    dfx_dy = (dx_pad[:, :, 2:, 1:-1] - dx_pad[:, :, :-2, 1:-1]) * 0.5
+
+    dfy_dx = (dy_pad[:, :, 1:-1, 2:] - dy_pad[:, :, 1:-1, :-2]) * 0.5
+    dfy_dy = (dy_pad[:, :, 2:, 1:-1] - dy_pad[:, :, :-2, 1:-1]) * 0.5
+
+    jacobian = torch.cat(
+        [dfx_dx, dfx_dy, dfy_dx, dfy_dy],
+        dim=1,
+    )
+    
+    return jacobian
 
 
 class GeoNT(nn.Module):
@@ -35,7 +70,7 @@ class GeoNT(nn.Module):
             features=128,
         )
         self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3)
-        self.motion_patch_embed = PatchEmbed(in_chans=5, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
+        self.motion_patch_embed = PatchEmbed(in_chans=9, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
         self.cam_dec = CameraDec(dim_in=1536)
 
     def forward(
@@ -63,11 +98,15 @@ class GeoNT(nn.Module):
         # make flow intrinsic-invariant
         dx, dy = flow[:, 0] / fx, flow[:, 1] / fy
 
+        # flow jacobian
+        jacobian = flow_jacobian(torch.stack((dx, dy), dim=1)) * 320
+
         x = x.expand(dx.shape[0], -1, -1)
         y = y.expand(dy.shape[0], -1, -1)
 
         # motion field encoder
         motion_field = torch.stack((x, y, dx * 50, dy * 50, flow_info), dim=1)
+        motion_field = torch.cat((motion_field, jacobian), dim=1)
         motion_token = self.motion_patch_embed(motion_field)
 
         # ---- depth tokenization ---- #

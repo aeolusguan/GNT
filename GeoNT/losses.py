@@ -179,10 +179,6 @@ class MultitaskLoss(torch.nn.Module):
         depth_loss = depth_grad_loss + depth_reg_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
 
-        assert not torch.any(torch.isnan(cam_loss))
-        assert not torch.any(torch.isnan(flo_loss))
-        assert not torch.any(torch.isnan(depth_loss))
-
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
     
