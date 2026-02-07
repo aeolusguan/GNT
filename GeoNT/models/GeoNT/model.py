@@ -8,7 +8,8 @@ from .heads.dpt_head import DPTHead
 from .cam_dec import CameraDec
 
 from GeoNT.geom.graph_utils import graph_to_edge_list, keyframe_indices
-from ..external import load_moge, load_raft
+from ..external import load_moge, load_raft, load_romav2
+from ..external import InputPadder, _interpolate_warp_and_confidence, to_pixel
 from GeoNT.geom.projective_ops import projective_transform
 from lietorch import SE3
 
@@ -56,6 +57,7 @@ class GeoNT(nn.Module):
             out_layers=[5, 7, 9, 11],
             alt_start=4,
             qknorm_start=4,
+            rope_start=4,
             cat_token=True,
         )
         self.embed_dim = self.backbone.pretrained.embed_dim
@@ -69,8 +71,8 @@ class GeoNT(nn.Module):
             out_channels=[96, 192, 384, 768],
             features=128,
         )
-        self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3)
-        self.motion_patch_embed = PatchEmbed(in_chans=9, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
+        self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3, flatten_embedding=False)
+        self.motion_patch_embed = PatchEmbed(in_chans=5, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3, flatten_embedding=False)
         self.cam_dec = CameraDec(dim_in=1536)
 
     def forward(
@@ -99,14 +101,14 @@ class GeoNT(nn.Module):
         dx, dy = flow[:, 0] / fx, flow[:, 1] / fy
 
         # flow jacobian
-        jacobian = flow_jacobian(torch.stack((dx, dy), dim=1)) * 320
+        # jacobian = flow_jacobian(torch.stack((dx, dy), dim=1)) * 320
 
         x = x.expand(dx.shape[0], -1, -1)
         y = y.expand(dy.shape[0], -1, -1)
 
         # motion field encoder
         motion_field = torch.stack((x, y, dx * 50, dy * 50, flow_info), dim=1)
-        motion_field = torch.cat((motion_field, jacobian), dim=1)
+        # motion_field = torch.cat((motion_field, jacobian), dim=1)
         motion_token = self.motion_patch_embed(motion_field)
 
         # ---- depth tokenization ---- #
@@ -117,9 +119,9 @@ class GeoNT(nn.Module):
         depth_token = self.depth_patch_embed(depthmap)
 
         # expand the edge size
-        depth_token = depth_token.expand(motion_token.shape[0], -1, -1)
+        depth_token = depth_token.expand(motion_token.shape[0], -1, -1, -1)
 
-        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,N,C]
+        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,H,W,C]
 
         # multi-view transformer aggregation
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16):
@@ -168,6 +170,7 @@ class GeoNTWrapper(nn.Module):
     def __init__(self):
         super().__init__()
 
+        # self.matcher = load_romav2()
         self.raft = load_raft()
         self.mono = load_moge('v2')
         self.model = GeoNT()
@@ -203,6 +206,98 @@ class GeoNTWrapper(nn.Module):
 
         return scaled_depth, scale
     
+    # @torch.no_grad()
+    # def extract_matches(self, images, ii, jj):
+    #     # images: B,S,3,H,W
+    #     B, S, _, H, W = images.shape
+    #     assert B == 1
+    #     images = images.flatten(0, 1)
+    #     padder = InputPadder(images.shape)
+    #     images = padder.pad(images)[0]
+    #     # assume images between [0, 1]
+    #     fmaps = self.matcher.f(images)
+    #     refiner_features = self.matcher.refiner_features(images)
+
+    #     # match feats
+    #     img_A, img_B = images[ii], images[jj]
+    #     matcher_output = self.matcher.matcher(
+    #         [x[ii] for x in fmaps], [x[jj] for x in fmaps], img_A=img_A, img_B=img_B, bidirectional=False
+    #     )
+    #     warp_AB, confidence_AB = (
+    #         matcher_output["warp_AB"],
+    #         matcher_output["confidence_AB"],
+    #     )
+    #     # refine warp
+    #     B, C, H, W = img_A.shape
+    #     scale_factor = torch.tensor(
+    #         (W / self.matcher.anchor_width, H / self.matcher.anchor_height), device=img_A.device
+    #     )
+    #     refiner_features_A, refiner_features_B = {k: v[ii] for k, v in refiner_features.items()}, {k: v[jj] for k, v in refiner_features.items()}
+    #     for patch_size_str, refiner in self.matcher.refiners.items():
+    #         patch_size = int(patch_size_str)
+    #         warp_AB, confidence_AB = _interpolate_warp_and_confidence(
+    #             warp=warp_AB,
+    #             confidence=confidence_AB,
+    #             H=H,
+    #             W=W,
+    #             patch_size=patch_size,
+    #             zero_out_precision=False,
+    #         )
+
+    #         f_patch_A = refiner_features_A[patch_size]
+    #         f_patch_B = refiner_features_B[patch_size]
+    #         refiner_output_AB = refiner(
+    #             f_A=f_patch_A,
+    #             f_B=f_patch_B,
+    #             prev_warp=warp_AB,
+    #             prev_confidence=confidence_AB,
+    #             scale_factor=scale_factor,
+    #         )
+                
+    #         warp_AB, confidence_AB = (
+    #             refiner_output_AB["warp"],
+    #             refiner_output_AB["confidence"],
+    #         )
+    #     warp_AB = to_pixel(warp_AB, H=H, W=W)
+    #     warp_AB = padder.unpad(warp_AB.permute(0, 3, 1, 2)).clone()
+    #     confidence_AB = padder.unpad(confidence_AB.permute(0, 3, 1, 2)).clone()
+    #     overlap_AB = confidence_AB[:, :1].sigmoid()
+    #     preds = {
+    #         "warp_AB": warp_AB,
+    #         "overlap_AB": overlap_AB,
+    #         "precision_AB": confidence_AB[:, 1:4],
+    #     }
+    #     return preds
+
+    @torch.no_grad()
+    def extract_matches(self, images, ii, jj):
+        B, S, _, H, W = images.shape
+        images = images.reshape(B*S, *images.shape[2:])
+        images = 2 * images - 1.0
+
+        # padding
+        padder = InputPadder(images.shape)
+        images = padder.pad(images)[0]
+        fmaps = self.raft.fnet(images)
+
+        img1, img2 = images[ii], images[jj]  
+        fmap1, fmap2 = fmaps[ii], fmaps[jj]
+        output = self.raft.infer_with_fmap(img1, img2, fmap1, fmap2, padder)
+
+        flow_final = output['flow']
+        info_final = output['info']
+        weight = torch.softmax(info_final[:, :2], dim=1)
+        raw_b = info_final[:, 2:]
+        log_b = torch.zeros_like(raw_b)
+        var_max, var_min = self.raft.args.var_max, self.raft.args.var_min
+        # Large b Component
+        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
+        # Small b Component
+        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
+        info = (torch.exp(-log_b) * weight).sum(dim=1)
+
+        return flow_final, info
+
     def forward(self, images, intrinsics, graph, gt_depths, gt_depths_valid, gt_pose, use_fp16=False):
 
         ii, jj, kk = graph_to_edge_list(graph)
@@ -214,32 +309,10 @@ class GeoNTWrapper(nn.Module):
         depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # predict optical flow between graph edges
-        images = images[:, :, [2,1,0]]  # from BGR to RGB
+        images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
         B, S, _, H, W = images.shape
         assert B == 1
-        # fmaps, images_, padder = self.raft.extract_features(images.reshape(B*S, *images.shape[2:]))
-        # images_ = images_.reshape(B, S, *images_.shape[1:])
-        # fmaps = fmaps.reshape(B, S, *fmaps.shape[1:])
-        # image1 = images_[:, ii]  
-        # image2 = images_[:, jj]
-        # fmap1 = fmaps[:, ii]
-        # fmap2 = fmaps[:, jj]
-        # output = self.raft.continue_infer(image1.flatten(0, 1), image2.flatten(0, 1), fmap1.flatten(0, 1), fmap2.flatten(0, 1), padder)
-
-        # flow_final = output['flow']
-        # info_final = output['info']
-        # weight = torch.softmax(info_final[:, :2], dim=1)
-        # raw_b = info_final[:, 2:]
-        # log_b = torch.zeros_like(raw_b)
-        # var_max, var_min = self.raft.args.var_max, self.raft.args.var_min
-        # # Large b Component
-        # log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
-        # # Small b Component
-        # log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
-        # info = (torch.exp(-log_b) * weight).sum(dim=1)
-
-        # del weight, raw_b, log_b, output
-        # del fmaps, images_, fmap1, fmap2, image1, image2
+        # flow_final_est, info_est = self.extract_matches(images, ii, jj)
 
         # ====
         gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
@@ -252,12 +325,25 @@ class GeoNTWrapper(nn.Module):
         )
         flow_final = (coords0 - torch.stack((u, v), dim=-1))[0].permute(0, 3, 1, 2)
         info = (val0.squeeze(-1) * gt_depths_valid[:, ii].float())[0]
+
+        # error = torch.norm(flow_final_est - flow_final, dim=1, keepdim=False)
+        # flow_norm = torch.norm(flow_final, dim=1, keepdim=False)
+        # info_ = info * info_est
+        # print("error", error[1, 200:210, 200:210], flow_norm[1, 200:210, 200:210], flow_final_est[1, 0, 200:210, 200:210])
+        # print("info", info_[1, 200:210, 200:210])
+
+        # romav2 match
+        # match_preds = self.extract_matches(images, ii, jj)
+        # coords0_est = match_preds["warp_AB"]
+        # error = torch.norm(coords0_est.permute(0, 2, 3, 1) - coords0, dim=-1, keepdim=False)
+        # print("error", error[0, 0, 300:310, 300:310])
+        # print("warp_AB", coords0_est[0, :, 200:210, 200:210])
         # ====
 
         # Monocular depth prior
         fx = intrinsics[0, :, 0]
         fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
-        depth_predictions = self.mono.infer(images[0] / 255.0, fov_x=fov_x)
+        depth_predictions = self.mono.infer(images[0], fov_x=fov_x)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
         scaled_depth, scale = self.normalize_depth(mono_depths.clone(), valid)
 
@@ -290,8 +376,8 @@ class GeoNTWrapper(nn.Module):
             "pose_graph": pose_graph[None],
             "depth": depths[None],
             "valid": valid[None],
-            "flow": flow_final,
-            "info": info,
+            # "flow": flow_final,
+            # "info": info,
             "scale": scale[None],  # (B,S)
         }
 

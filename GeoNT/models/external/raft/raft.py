@@ -151,21 +151,8 @@ class RAFT(nn.Module):
         else:
             return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None}
         
-    def extract_features(self, images):
-        """ run feature extraction networks """
-
-        images = 2 * (images / 255.0) - 1.0
-        images = images.contiguous()
-
-        # padding
-        padder = InputPadder(images.shape)
-        images = padder.pad(images)[0]
-        fmaps = self.fnet(images)
-
-        return fmaps, images, padder
-    
     @torch.no_grad()
-    def continue_infer(self, image1, image2, fmap1, fmap2, padder, iters=None):
+    def infer_with_fmap(self, image1, image2, fmap1, fmap2, padder, iters=None):
         """ Estimate optical flow between pair of frames """
         if iters is None:
             iters = self.args.iters

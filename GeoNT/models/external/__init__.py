@@ -7,8 +7,9 @@ import torch
 # RAFT_PATH_ROOT = join(dirname(__file__), 'SEA-RAFT')
 # sys.path.append(RAFT_PATH_ROOT)
 
-from .raft import RAFT
+from .raft import RAFT, InputPadder
 from .moge import import_model_class_by_version
+from .romav2 import RoMaV2, _interpolate_warp_and_confidence, to_pixel
 
 
 def load_raft():
@@ -48,3 +49,9 @@ def load_raft():
 def load_moge(version: str):
     model = import_model_class_by_version(version).from_pretrained("Ruicheng/moge-2-vitl")
     return model.eval()
+
+
+def load_romav2():
+    model = RoMaV2()
+    model.apply_setting("base")
+    return model

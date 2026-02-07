@@ -34,7 +34,7 @@ def get_args_parser():
     # model
     parser.add_argument('--pretrained', default=None, help='path of a starting checkpoint')
     parser.add_argument('--fmin', type=float, default=8.0)
-    parser.add_argument('--fmax', type=float, default=96.0)
+    parser.add_argument('--fmax', type=float, default=48.0)
     
     # training
     parser.add_argument('--seed', default=0, type=int, help="Random seed")
