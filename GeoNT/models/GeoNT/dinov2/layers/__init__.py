@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 # from .attention import MemEffAttention
-from .block import Block
+from .block import Block, GiTBlock
 from .layer_scale import LayerScale
 from .mlp import Mlp
 from .patch_embed import PatchEmbed, make_2tuple
@@ -18,6 +18,7 @@ __all__ = [
     SwiGLUFFN,
     SwiGLUFFNFused,
     Block,
+    GiTBlock,
     # MemEffAttention,
     LayerScale,
     PositionGetter,

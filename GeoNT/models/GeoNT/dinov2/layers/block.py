@@ -101,6 +101,109 @@ class Block(nn.Module):
         return x
 
 
+def modulate(x, shift, scale):
+    return x * (1 + scale) + shift
+
+
+class GiTBlock(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = False,
+        proj_bias: bool = True,
+        ffn_bias: bool = True,
+        drop: float = 0.0,
+        attn_drop: float = 0.0,
+        init_values=None,
+        drop_path: float = 0.0,
+        act_layer: Callable[..., nn.Module] = nn.GELU,
+        norm_layer: Callable[..., nn.Module] = nn.LayerNorm,
+        attn_class: Callable[..., nn.Module] = Attention,
+        ffn_layer: Callable[..., nn.Module] = Mlp,
+        qk_norm: bool = False,
+        rope=None,
+        ln_eps: float = 1e-6,
+    ) -> None:
+        super().__init__()
+        self.norm1 = norm_layer(dim, eps=ln_eps)
+        self.attn = attn_class(
+            dim,
+            num_heads=num_heads,
+            qkv_bias=qkv_bias,
+            proj_bias=proj_bias,
+            attn_drop=attn_drop,
+            proj_drop=drop,
+            qk_norm=qk_norm,
+            rope=rope,
+        )
+        self.ls1 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.norm2 = norm_layer(dim, eps=ln_eps)
+        mlp_hidden_dim = int(dim * mlp_ratio)
+        self.mlp = ffn_layer(
+            in_features=dim,
+            hidden_features=mlp_hidden_dim,
+            act_layer=act_layer,
+            drop=drop,
+            bias=ffn_bias,
+        )
+        self.ls2 = LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
+        self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+
+        self.sample_drop_ratio = drop_path
+
+        # patch normalization (affine-free)
+        self.patch_norm1 = norm_layer(dim, elementwise_affine=False, eps=ln_eps)
+        self.patch_norm2 = norm_layer(dim, elementwise_affine=False, eps=ln_eps)
+
+        # Separate modulation heads
+        self.adaLN_msa = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim * 3, bias=True)  # shift, scale, gate
+        )
+
+        self.adaLN_mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(dim, dim * 3, bias=True)
+        )
+
+        # zero-init for stability
+        for module in [self.adaLN_msa, self.adaLN_mlp]:
+            nn.init.constant_(module[-1].weight, 0)
+            nn.init.constant_(module[-1].bias, 0)
+
+    def forward(self, x: Tensor, pos=None, attn_mask=None) -> Tensor:
+        # split
+        c = x[:, :1, :]
+        z = x[:, 1:, :]
+        # normalize camera
+        c_norm = self.norm1(c)
+        # generate MSA modulation parameters
+        shift_msa, scale_msa, gate_msa = self.adaLN_msa(c_norm).chunk(3, dim=-1)
+        z_mod = modulate(self.patch_norm1(z), shift_msa, scale_msa)
+
+        # attention
+        attn_out = self.attn(torch.cat([c_norm, z_mod], dim=1), pos=pos, attn_mask=attn_mask)
+
+        # residual connection with modulation
+        c = c + self.drop_path1(self.ls1(attn_out[:, :1, :]))
+        z = z + self.drop_path1(gate_msa * attn_out[:, 1:, :])
+
+        # mlp
+        c_norm = self.norm2(c)
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_mlp(c_norm).chunk(3, dim=-1)
+        z_mod = modulate(self.patch_norm2(z), shift_mlp, scale_mlp)
+
+        mlp_out = self.mlp(torch.cat([c_norm, z_mod], dim=1))
+
+        c = c + self.drop_path2(self.ls2(mlp_out[:, :1, :]))
+        z = z + self.drop_path2(gate_mlp * mlp_out[:, 1:, :])
+
+        return torch.cat([c, z], dim=1)
+
 def drop_add_residual_stochastic_depth(
     x: Tensor,
     residual_func: Callable[[Tensor], Tensor],

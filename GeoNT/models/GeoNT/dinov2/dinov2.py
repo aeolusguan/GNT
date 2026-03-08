@@ -17,6 +17,7 @@ from .vision_transformer import (
     vit_large,
     vit_small,
 )
+from .layers import GiTBlock
 
 
 class DinoV2(nn.Module):
@@ -53,6 +54,7 @@ class DinoV2(nn.Module):
             qknorm_start=qknorm_start,
             rope_start=rope_start,
             cat_token=cat_token,
+            block_fn=GiTBlock,
         )
 
     def forward(self, x, **kwargs):

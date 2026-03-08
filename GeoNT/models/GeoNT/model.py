@@ -6,6 +6,7 @@ from .dinov2.dinov2 import DinoV2
 from .dinov2.layers import PatchEmbed
 from .heads.dpt_head import DPTHead
 from .cam_dec import CameraDec
+from .heads.linear_head import LinearDepth
 
 from GeoNT.geom.graph_utils import graph_to_edge_list, keyframe_indices
 from ..external import load_moge, load_raft, load_romav2
@@ -57,19 +58,24 @@ class GeoNT(nn.Module):
             out_layers=[5, 7, 9, 11],
             alt_start=4,
             qknorm_start=4,
-            rope_start=4,
+            rope_start=-1,
             cat_token=True,
         )
         self.embed_dim = self.backbone.pretrained.embed_dim
         self.patch_size = self.backbone.pretrained.patch_size
-        self.depth_head = DPTHead(
-            dim_in=2*self.embed_dim,
+        # self.depth_head = DPTHead(
+        #     dim_in=2*self.embed_dim,
+        #     patch_size=self.patch_size,
+        #     output_dim=2,
+        #     activation="exp",
+        #     conf_activation="sigmoid",
+        #     out_channels=[96, 192, 384, 768],
+        #     features=128,
+        # )
+        self.depth_head = LinearDepth(
             patch_size=self.patch_size,
-            output_dim=2,
+            dec_embed_dim=2*self.embed_dim,
             activation="exp",
-            conf_activation="sigmoid",
-            out_channels=[96, 192, 384, 768],
-            features=128,
         )
         self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3, flatten_embedding=False)
         self.motion_patch_embed = PatchEmbed(in_chans=5, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3, flatten_embedding=False)
@@ -129,11 +135,8 @@ class GeoNT(nn.Module):
 
         # process features through depth head
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth, depth_conf = self.depth_head(
-                feats, H=ht, W=wd, patch_start_idx=0
-            )
+            depth = self.depth_head(feats, img_shape=(ht, wd))
             depth = depth.squeeze(0)
-            depth_conf = depth_conf.squeeze(0)
             pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)
 
         output = {
