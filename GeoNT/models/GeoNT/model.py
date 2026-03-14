@@ -140,7 +140,7 @@ class GeoNT(nn.Module):
             pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)
 
         output = {
-            "depth": depth,  # H,W
+            "depth": depth,  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
             "pose_enc": pose_enc,  # E,7
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
@@ -167,6 +167,10 @@ class GeoNT(nn.Module):
             aux_features[f"feat_layer_{feat_layer}"] = feat_reshaped
         
         return aux_features
+    
+    @property
+    def num_out_layers(self):
+        return len(self.backbone.out_layers)
     
 
 class GeoNTWrapper(nn.Module):
@@ -309,7 +313,8 @@ class GeoNTWrapper(nn.Module):
         jj = jj.to(device=images.device, dtype=torch.long)
 
         pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
-        depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
+        L = self.model.num_out_layers if self.training else 1
+        depths = torch.zeros((images.shape[1], L, images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # predict optical flow between graph edges
         images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
@@ -377,7 +382,7 @@ class GeoNTWrapper(nn.Module):
 
         predictions = {
             "pose_graph": pose_graph[None],
-            "depth": depths[None],
+            "depth": depths[None].squeeze(1),  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
             "valid": valid[None],
             # "flow": flow_final,
             # "info": info,

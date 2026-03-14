@@ -115,7 +115,7 @@ class MultitaskLoss(torch.nn.Module):
         Returns:
             Dict containing individual losses and total objective
         """
-        pr_depth = predictions["depth"].clip(max=100, min=1e-3)
+        pr_depth = predictions["depth"][:, :, -1].clip(max=100, min=1e-3)
         gt_depth = batch["depth"]
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
 
@@ -154,32 +154,22 @@ class MultitaskLoss(torch.nn.Module):
         # print(gt_depth[0, ii[2], 230:240, 360:370])
         #print(predictions["info"][2, 230:240, 360:370])
 
-        # Compute L1 loss between predicted and ground truth points
-        depth_reg_loss = torch.abs(normed_pr_depth[valid_mask] - normed_gt_depth[valid_mask])
-        depth_reg_loss = check_and_fix_inf_nan(depth_reg_loss, "depth_reg_loss")
-        # Process regular regression loss
-        if depth_reg_loss.numel() > 0:
-            # Filter out outliers using quantile-based thresholding
-            if self.args.depth_valid_range > 0:
-                depth_reg_loss = filter_by_quantile(depth_reg_loss, self.args.depth_valid_range)
-            
-            depth_reg_loss = check_and_fix_inf_nan(depth_reg_loss, f"depth_reg_loss")
-            depth_reg_loss = depth_reg_loss.mean()
-        else:
-            depth_reg_loss = (0.0 * pr_depth).mean()
-
-        depth_grad_loss = gradient_loss_multi_scale_wrapper(
-            normed_pr_depth.flatten(0, 1).unsqueeze(-1),
-            normed_gt_depth.flatten(0, 1).unsqueeze(-1),
-            valid_mask.flatten(0, 1),
-            gradient_loss_fn=gradient_loss,
-        )
-        depth_grad_loss = check_and_fix_inf_nan(depth_grad_loss, "depth_grad_loss")
-
+        depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
         depth_loss = depth_grad_loss + depth_reg_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
 
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss
+
+        # Compute auxiliary losses for intermediate layers
+        L = predictions["depth"].shape[2] # number of output layers
+        assert len(self.args.w_depth_aux) == L - 1, "Length of w_depth_aux should be num_out_layers - 1"
+        for i in range(L-1):
+            pr_depth = predictions["depth"][:, :, i].clip(max=100, min=1e-3)
+            normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
+            normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
+            depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
+            depth_loss = depth_grad_loss + depth_reg_loss
+            total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
     
     def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale):
@@ -205,6 +195,30 @@ class MultitaskLoss(torch.nn.Module):
         }
 
         return cam_loss, metrics
+    
+    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, valid_mask):
+        # Compute L1 loss between predicted and ground truth points
+        depth_reg_loss = torch.abs(normed_pr_depth[valid_mask] - normed_gt_depth[valid_mask])
+        depth_reg_loss = check_and_fix_inf_nan(depth_reg_loss, "depth_reg_loss")
+        # Process regular regression loss
+        if depth_reg_loss.numel() > 0:
+            # Filter out outliers using quantile-based thresholding
+            if self.args.depth_valid_range > 0:
+                depth_reg_loss = filter_by_quantile(depth_reg_loss, self.args.depth_valid_range)
+            
+            depth_reg_loss = depth_reg_loss.mean()
+        else:
+            depth_reg_loss = (0.0 * normed_pr_depth).mean()
+
+        depth_grad_loss = gradient_loss_multi_scale_wrapper(
+            normed_pr_depth.flatten(0, 1).unsqueeze(-1),
+            normed_gt_depth.flatten(0, 1).unsqueeze(-1),
+            valid_mask.flatten(0, 1),
+            gradient_loss_fn=gradient_loss,
+        )
+        depth_grad_loss = check_and_fix_inf_nan(depth_grad_loss, "depth_grad_loss")
+
+        return depth_reg_loss, depth_grad_loss
 
 
 def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradient_loss_fn = None, conf=None):
