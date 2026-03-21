@@ -63,6 +63,8 @@ def get_args_parser():
     parser.add_argument('--w_depth', type=float, default=1.0)
     parser.add_argument('--w_depth_aux', type=float, nargs='+', default=[0.1, 0.3, 0.5], 
                         help="weights for auxiliary depth losses, should be a list of length num_out_layers-1")
+    parser.add_argument('--w_pose_aux', type=float, nargs='+', default=[0.1, 0.3, 0.5], 
+                        help="weights for auxiliary pose losses, should be a list of length num_out_layers-1")
     parser.add_argument('--depth_valid_range', type=float, default=0.98)
 
     # others

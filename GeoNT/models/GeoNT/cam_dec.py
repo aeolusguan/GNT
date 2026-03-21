@@ -29,14 +29,12 @@ class CameraDec(nn.Module):
         self.fc_t = nn.Linear(output_dim, 3)
         self.fc_qvec = nn.Linear(output_dim, 4)
 
-    def forward(self, feat, camera_encoding=None, *args, **kwargs):
-        B, N = feat.shape[:2]
-        feat = feat.reshape(B * N, -1)
-        feat = self.backbone(feat)
-        out_t = self.fc_t(feat.float()).reshape(B, N, 3)
-        if camera_encoding is None:
-            out_qvec = self.fc_qvec(feat.float()).reshape(B, N, 4)
-        else:
-            out_qvec = camera_encoding[..., 3:7]
+    def forward(self, feats, *args, **kwargs):
+        if not self.training:  # inference stage, only use the last layer's output
+            feats = feats[-1:]
+        feats = torch.stack([feat[1] for feat in feats], dim=2)  # B,E,L,C
+        feats = self.backbone(feats)
+        out_t = self.fc_t(feats.float())
+        out_qvec = self.fc_qvec(feats.float())
         pos_enc = torch.cat([out_t, out_qvec], dim=-1)
         return pos_enc

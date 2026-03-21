@@ -116,6 +116,7 @@ class MultitaskLoss(torch.nn.Module):
             Dict containing individual losses and total objective
         """
         pr_depth = predictions["depth"][:, :, -1].clip(max=100, min=1e-3)
+        pr_rel_poses = SE3(predictions["pose_graph"][:, :, -1])
         gt_depth = batch["depth"]
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
 
@@ -126,7 +127,6 @@ class MultitaskLoss(torch.nn.Module):
         normed_gt_depth = normed_gt_depth.view(*gt_depth.shape)
         normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
 
-        pr_rel_poses = SE3(predictions["pose_graph"])
         graph = batch["graph"]
         gt_pose = SE3(batch["poses"]).inv()  # convert poses w2c -> c2w
 
@@ -165,11 +165,17 @@ class MultitaskLoss(torch.nn.Module):
         assert len(self.args.w_depth_aux) == L - 1, "Length of w_depth_aux should be num_out_layers - 1"
         for i in range(L-1):
             pr_depth = predictions["depth"][:, :, i].clip(max=100, min=1e-3)
+            pr_rel_poses = SE3(predictions["pose_graph"][:, :, i])
             normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
+            pr_scale = pr_scale.view(*pr_depth.shape[:2])
             normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
             depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
             depth_loss = depth_grad_loss + depth_reg_loss
-            total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss
+
+            cam_loss, _ = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale)
+            cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
+
+            total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss + self.args.w_pose_aux[i] * self.args.w_pose * cam_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
     
     def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale):

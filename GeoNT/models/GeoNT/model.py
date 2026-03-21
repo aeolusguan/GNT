@@ -135,13 +135,12 @@ class GeoNT(nn.Module):
 
         # process features through depth head
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth = self.depth_head(feats, img_shape=(ht, wd))
-            depth = depth.squeeze(0)
-            pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)
+            depth = self.depth_head(feats, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            pose_enc = self.cam_dec(feats).squeeze(0)  # E,L,7
 
         output = {
             "depth": depth,  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
-            "pose_enc": pose_enc,  # E,7
+            "pose_enc": pose_enc,  # E,L,7
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
         
@@ -312,8 +311,8 @@ class GeoNTWrapper(nn.Module):
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
 
-        pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
         L = self.model.num_out_layers if self.training else 1
+        pose_graph = torch.zeros((ii.shape[0], L, 7), device=images.device, dtype=torch.float32)
         depths = torch.zeros((images.shape[1], L, images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # predict optical flow between graph edges
@@ -381,8 +380,8 @@ class GeoNTWrapper(nn.Module):
             pose_graph[mask] = output_geo["pose_enc"]
 
         predictions = {
-            "pose_graph": pose_graph[None],
-            "depth": depths[None].squeeze(1),  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
+            "pose_graph": pose_graph[None].squeeze(2),  # 1,E,7 in inference stage, 1,E,L,7 in training stage for auxiliary supervision
+            "depth": depths[None].squeeze(2),  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
             "valid": valid[None],
             # "flow": flow_final,
             # "info": info,
