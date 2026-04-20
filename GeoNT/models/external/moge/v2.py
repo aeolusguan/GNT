@@ -178,7 +178,8 @@ class MoGeModel(nn.Module):
             'points': points, 
             'normal': normal,
             'mask': mask,
-            'metric_scale': metric_scale
+            'metric_scale': metric_scale,
+            'feature': F.interpolate(features[-2], (img_h, img_w), mode='bilinear', align_corners=False, antialias=False),
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
 
@@ -233,7 +234,7 @@ class MoGeModel(nn.Module):
         # Forward pass
         with torch.autocast(device_type=self.device.type, dtype=torch.float16, enabled=use_fp16 and self.dtype != torch.float16):
             output = self.forward(image, num_tokens=num_tokens)
-        points, normal, mask, metric_scale = (output.get(k, None) for k in ['points', 'normal', 'mask', 'metric_scale'])
+        points, normal, mask, metric_scale, feature = (output.get(k, None) for k in ['points', 'normal', 'mask', 'metric_scale', 'feature'])
 
         # Always process the output in fp32 precision
         points, normal, mask, metric_scale, fov_x = map(lambda x: x.float() if isinstance(x, torch.Tensor) else x, [points, normal, mask, metric_scale, fov_x])
@@ -286,7 +287,8 @@ class MoGeModel(nn.Module):
             'intrinsics': intrinsics,
             'depth': depth,
             'mask': mask_binary,
-            'normal': normal
+            'normal': normal,
+            'feature': feature,
         }
         return_dict = {k: v for k, v in return_dict.items() if v is not None}
 

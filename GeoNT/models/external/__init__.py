@@ -9,7 +9,6 @@ import torch
 
 from .raft import RAFT, InputPadder
 from .moge import import_model_class_by_version
-from .romav2 import RoMaV2, _interpolate_warp_and_confidence, to_pixel
 
 
 def load_raft():
