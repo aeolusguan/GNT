@@ -159,9 +159,8 @@ class FlowModel(nn.Module):
         net = self.net_init(net)
         init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
         flow_8x = torch.median(init, dim=2, keepdim=False)[0]
-        init = einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8)
+        init = padder.unpad(einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8))
         
-
         if iters > 0:
             corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
 
@@ -211,3 +210,42 @@ class FlowModel(nn.Module):
             return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions, 'init': init * 8}
         else:
             return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None, 'init': init * 8}
+        
+    def forward_with_fmap(self, fmap1_8x, fmap2_8x, bases, iters=None):
+        """ Estimate optical flow between pair of frames """
+        if iters is None:
+            iters = self.args.iters
+        
+        N, _, H, W = fmap1_8x.shape
+        dilation = torch.ones(N, 1, H, W, device=fmap1_8x.device)
+
+        # Initialization
+        x = self.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
+        x, net = self.init_decoder(x, bases)
+        init = self.init_pred_head(x)
+        net = self.net_init(net)
+        init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
+        flow_8x = torch.median(init, dim=2, keepdim=False)[0]
+        init = einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8)
+        
+        if iters > 0:
+            corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
+
+        flow_predictions = []
+        info_predictions = []
+        for itr in range(iters):
+            N, _, H, W = flow_8x.shape
+            flow_8x = flow_8x.detach()
+            coords2 = coords_grid(N, H, W, device=fmap1_8x.device) + flow_8x
+            corr = corr_fn(coords2, dilation=dilation)
+            net = self.update_block(net, corr, flow_8x)
+            flow_update = self.flow_head(net)
+            weight_update = .25 * self.upsample_weight(net)
+            flow_8x = flow_8x + flow_update[:, :2]
+            info_8x = flow_update[:, 2:]
+            # upsample predictions
+            flow_up, info_up = self.upsample_data(flow_8x, info_8x, weight_update)
+            flow_predictions.append(flow_up)
+            info_predictions.append(info_up)
+
+        return {'flow': flow_predictions, 'info': info_predictions, 'init': init * 8}

@@ -116,9 +116,10 @@ class MultitaskLoss(torch.nn.Module):
             Dict containing individual losses and total objective
         """
         pr_depth = predictions["depth"][:, :, -1].clip(max=100, min=1e-3)
-        pr_rel_poses = SE3(predictions["pose_graph"][:, :, -1])
+        pr_rel_poses = SE3(predictions["pose_graph"])
         gt_depth = batch["depth"]
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
+        device = pr_depth.device
 
         normed_gt_depth, gt_scale = normalize_depth(gt_depth.flatten(0, 1), valid_mask.flatten(0, 1))
         normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
@@ -132,10 +133,21 @@ class MultitaskLoss(torch.nn.Module):
 
         intrinsics = batch["intrinsics"]
 
-        cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale)
+        # compute weights for intermediate flow predictions
+        i_weights = predictions["i_weights"]
+        ii, jj, kk = graph_to_edge_list(graph)
+        ii = ii.to(device=device, dtype=torch.long)
+        iu = torch.unique(ii)
+        d_weights = torch.zeros((gt_depth.shape[1],), device=device)
+        for fi in iu:
+            mask = (ii == fi)
+            d_weights[fi] = i_weights[0][mask].mean()
+
+        cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale, i_weights)
         cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
         # cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale)
-        flo_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
+        f_weights = i_weights * d_weights[None, ii]
+        flo_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask, weights=f_weights)
         flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
 
         # ii, jj, kk = graph_to_edge_list(graph)
@@ -154,7 +166,7 @@ class MultitaskLoss(torch.nn.Module):
         # print(gt_depth[0, ii[2], 230:240, 360:370])
         #print(predictions["info"][2, 230:240, 360:370])
 
-        depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
+        depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask, d_weights[None])
         depth_loss = depth_grad_loss + depth_reg_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
 
@@ -165,17 +177,12 @@ class MultitaskLoss(torch.nn.Module):
         assert len(self.args.w_depth_aux) == L - 1, "Length of w_depth_aux should be num_out_layers - 1"
         for i in range(L-1):
             pr_depth = predictions["depth"][:, :, i].clip(max=100, min=1e-3)
-            pr_rel_poses = SE3(predictions["pose_graph"][:, :, i])
             normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
-            pr_scale = pr_scale.view(*pr_depth.shape[:2])
             normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
-            depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
+            depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask, d_weights[None])
             depth_loss = depth_grad_loss + depth_reg_loss
 
-            cam_loss, _ = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale)
-            cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
-
-            total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss + self.args.w_pose_aux[i] * self.args.w_pose * cam_loss
+            total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
     
     def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale):
@@ -202,9 +209,10 @@ class MultitaskLoss(torch.nn.Module):
 
         return cam_loss, metrics
     
-    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, valid_mask):
+    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, valid_mask, weights):
         # Compute L1 loss between predicted and ground truth points
-        depth_reg_loss = torch.abs(normed_pr_depth[valid_mask] - normed_gt_depth[valid_mask])
+        depth_reg_loss = torch.abs(normed_pr_depth - normed_gt_depth) * weights[:, :, None, None]
+        depth_reg_loss = depth_reg_loss[valid_mask]
         depth_reg_loss = check_and_fix_inf_nan(depth_reg_loss, "depth_reg_loss")
         # Process regular regression loss
         if depth_reg_loss.numel() > 0:
@@ -220,6 +228,7 @@ class MultitaskLoss(torch.nn.Module):
             normed_pr_depth.flatten(0, 1).unsqueeze(-1),
             normed_gt_depth.flatten(0, 1).unsqueeze(-1),
             valid_mask.flatten(0, 1),
+            weights=weights.flatten(0, 1),
             gradient_loss_fn=gradient_loss,
         )
         depth_grad_loss = check_and_fix_inf_nan(depth_grad_loss, "depth_grad_loss")
@@ -227,7 +236,7 @@ class MultitaskLoss(torch.nn.Module):
         return depth_reg_loss, depth_grad_loss
 
 
-def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradient_loss_fn = None, conf=None):
+def gradient_loss_multi_scale_wrapper(prediction, target, mask, weights,scales=4, gradient_loss_fn = None, conf=None):
     """
     Multi-scale gradient loss wrapper. Applies gradient loss at multiple scales by subsampling the input.
     This helps capture both fine and coarse spatial structures.
@@ -236,6 +245,7 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradie
         prediction: (B, H, W, C) predicted values
         target: (B, H, W, C) ground truth values
         mask: (B, H, W) valid pixel mask
+        weights: (B,) per-view weight to apply to the loss
         scales: Number of scales to use
         gradient_loss_fn: Gradient loss function to apply
         conf: (B, H, W) confidence weights (optional)
@@ -248,6 +258,7 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradie
             prediction[:, ::step, ::step],
             target[:, ::step, ::step],
             mask[:, ::step, ::step],
+            weights,
             None if conf is None else conf[:, ::step, ]
         )
     
@@ -255,7 +266,7 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradie
     return total
 
 
-def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
+def gradient_loss(prediction, target, mask, weights, conf=None, gamma=1.0, alpha=0.2):
     """   
     Gradient-based loss. Compute the L1 difference between adjacent pixels in x and y directions.
 
@@ -263,6 +274,7 @@ def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
         prediction: (B, H, W, C) predicted values
         target: (B, H, W, C) ground truth values
         mask: (B, H, W) valid pixel mask
+        weights: (B,) per-view weight to apply to the loss
         conf: (B, H, W) confidence weights (optional)
         gamma: Weight for confidence loss
         alpha: Weight for confidence regularization
@@ -286,8 +298,8 @@ def gradient_loss(prediction, target, mask, conf=None, gamma=1.0, alpha=0.2):
     grad_y = torch.mul(mask_y, grad_y)
 
     # Clamp gradients to prevent outliers
-    grad_x = grad_x.clamp(max=100)
-    grad_y = grad_y.clamp(max=100)
+    grad_x = grad_x.clamp(max=100) * weights[:, None, None, None]
+    grad_y = grad_y.clamp(max=100) * weights[:, None, None, None]
 
     # Apply confidence weighting if provided
     if conf is not None:

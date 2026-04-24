@@ -63,8 +63,6 @@ def get_args_parser():
     parser.add_argument('--w_depth', type=float, default=1.0)
     parser.add_argument('--w_depth_aux', type=float, nargs='+', default=[0.1, 0.3, 0.5], 
                         help="weights for auxiliary depth losses, should be a list of length num_out_layers-1")
-    parser.add_argument('--w_pose_aux', type=float, nargs='+', default=[0.1, 0.3, 0.5], 
-                        help="weights for auxiliary pose losses, should be a list of length num_out_layers-1")
     parser.add_argument('--depth_valid_range', type=float, default=0.98)
 
     # others
@@ -92,7 +90,7 @@ def load_model(args, device):
     if args.pretrained and not args.resume:
         print('Loading pretrained: ', args.pretrained)
         ckpt = torch.load(args.pretrained, map_location=device)
-        print(model.load_state_dict(ckpt, strict=False))
+        print(model.gnt.load_state_dict(ckpt, strict=False))
         del ckpt  # in case it occupies memory
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -146,7 +144,7 @@ def train(args):
     print("effective batch size: %d" % eff_batch_size)
 
     # following timm: set wd as 0 for bias and norm layers
-    param_groups = misc.get_parameter_groups(model_without_ddp.model, args.weight_decay)
+    param_groups = misc.get_parameter_groups(model_without_ddp, args.weight_decay)
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.95))
     loss_scaler = NativeScaler()
 
@@ -265,7 +263,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             sys.exit(1)
         
         loss /= accum_iter
-        loss_scaler(loss, optimizer, parameters=model.module.model.parameters(),
+        loss_scaler(loss, optimizer, parameters=model.module.parameters(),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()

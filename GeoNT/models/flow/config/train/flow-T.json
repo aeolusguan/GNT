@@ -11,5 +11,6 @@
     "radius": 4,
     "dim": 128,
     "num_blocks": 2,
-    "iters": 4
+    "iters": 4,
+    "gamma": 0.8
 }

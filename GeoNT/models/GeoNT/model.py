@@ -9,8 +9,9 @@ from .cam_dec import CameraDec
 from .heads.linear_head import LinearDepth
 
 from GeoNT.geom.graph_utils import graph_to_edge_list, keyframe_indices
-from ..external import load_moge, load_raft, load_romav2
-from ..external import InputPadder, _interpolate_warp_and_confidence, to_pixel
+from ..external import load_moge, load_raft
+from ..flow.core.utils import InputPadder
+from ..flow import load_flow
 from GeoNT.geom.projective_ops import projective_transform
 from lietorch import SE3
 
@@ -136,7 +137,7 @@ class GeoNT(nn.Module):
         # process features through depth head
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
             depth = self.depth_head(feats, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
-            pose_enc = self.cam_dec(feats).squeeze(0)  # E,L,7
+            pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)  # E,7
 
         output = {
             "depth": depth,  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
@@ -176,16 +177,27 @@ class GeoNTWrapper(nn.Module):
     def __init__(self):
         super().__init__()
 
-        # self.matcher = load_romav2()
-        self.raft = load_raft()
+        self.flow = load_flow()
         self.mono = load_moge('v2')
-        self.model = GeoNT()
+        self.gnt = GeoNT()
 
-    def state_dict(self, *args, **kwargs):
-        return self.model.state_dict(*args, **kwargs)
-    
-    def load_state_dict(self, state_dict, strict=True, assign=False):
-        return self.model.load_state_dict(state_dict, strict, assign)
+        gamma = self.flow.args.gamma
+        i_weights = [0.1]
+        for i in range(self.flow.args.iters):
+            i_weights.append(gamma ** (self.flow.args.iters - i - 1))
+        self.register_buffer("i_weights", torch.tensor(i_weights, dtype=torch.float32))
+
+        self.free_model()
+
+    def free_model(self):
+        def _freeze_model(model):
+            model = model.eval()
+            for p in model.parameters():
+                p.requires_grad = False
+            for p in model.buffers():
+                p.requires_grad = False
+            return model
+        _freeze_model(self.mono)
     
     def normalize_depth(self, depth, mask, eps=1e-8):
         """
@@ -304,6 +316,49 @@ class GeoNTWrapper(nn.Module):
 
         return flow_final, info
 
+    def _frontend_forward(self, images, intrinsics, graph):
+
+        ii, jj, kk = graph_to_edge_list(graph)
+
+        ii = ii.to(device=images.device, dtype=torch.long)
+        jj = jj.to(device=images.device, dtype=torch.long)
+
+        images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
+        B, S, _, H, W = images.shape
+        assert B == 1
+
+        # Monocular depth prior
+        fx = intrinsics[0, :, 0]
+        fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
+        depth_predictions = self.mono.infer(images[0], fov_x=fov_x)
+        mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
+
+        # Predict optical flow between graph edges
+        mono_depths = mono_depths.clamp_min(0.01)
+        disps = torch.zeros_like(mono_depths)
+        disps[valid] = 1.0 / mono_depths[valid]
+        bases = self.flow.create_bases(disps.unsqueeze(1))
+        mono = depth_predictions["feature"]
+        
+        images = images.reshape(B*S, *images.shape[2:])
+        images = 2 * images - 1.0
+        
+        # padding
+        padder = InputPadder(images.shape)
+        images, mono, bases = padder.pad(images, mono, bases)
+        fmap_8x = self.flow.fnet(images)
+        mono_8x = self.flow.merge_head(mono)
+        fmap_8x = torch.cat((fmap_8x, mono_8x), dim=1)
+        flow_predictions = self.flow.forward_with_fmap(fmap_8x[ii], fmap_8x[jj], bases[ii])
+
+        flow_predictions = {
+            "flow": [padder.unpad(x) for x in flow_predictions["flow"]],
+            "info": [padder.unpad(x) for x in flow_predictions["info"]],
+            "init": padder.unpad(flow_predictions["init"]),
+        }
+
+        return flow_predictions, depth_predictions
+
     def forward(self, images, intrinsics, graph, gt_depths, gt_depths_valid, gt_pose, use_fp16=False):
 
         ii, jj, kk = graph_to_edge_list(graph)
@@ -311,27 +366,21 @@ class GeoNTWrapper(nn.Module):
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
 
-        L = self.model.num_out_layers if self.training else 1
-        pose_graph = torch.zeros((ii.shape[0], L, 7), device=images.device, dtype=torch.float32)
+        L = self.gnt.num_out_layers if self.training else 1
+        pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
         depths = torch.zeros((images.shape[1], L, images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
-        # predict optical flow between graph edges
-        images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
-        B, S, _, H, W = images.shape
-        assert B == 1
-        # flow_final_est, info_est = self.extract_matches(images, ii, jj)
-
         # ====
-        gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
-        coords0, val0 = projective_transform(gt_pose, 1.0 / gt_depths, intrinsics, ii, jj)
-        H, W = coords0.shape[2:4]
-        v, u = torch.meshgrid(
-            torch.arange(H, device=coords0.device, dtype=torch.float),
-            torch.arange(W, device=coords0.device, dtype=torch.float),
-            indexing="ij",
-        )
-        flow_final = (coords0 - torch.stack((u, v), dim=-1))[0].permute(0, 3, 1, 2)
-        info = (val0.squeeze(-1) * gt_depths_valid[:, ii].float())[0]
+        # gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
+        # coords0, val0 = projective_transform(gt_pose, 1.0 / gt_depths, intrinsics, ii, jj)
+        # H, W = coords0.shape[2:4]
+        # v, u = torch.meshgrid(
+        #     torch.arange(H, device=coords0.device, dtype=torch.float),
+        #     torch.arange(W, device=coords0.device, dtype=torch.float),
+        #     indexing="ij",
+        # )
+        # flow_final = (coords0 - torch.stack((u, v), dim=-1))[0].permute(0, 3, 1, 2)
+        # info = (val0.squeeze(-1) * gt_depths_valid[:, ii].float())[0]
 
         # error = torch.norm(flow_final_est - flow_final, dim=1, keepdim=False)
         # flow_norm = torch.norm(flow_final, dim=1, keepdim=False)
@@ -339,20 +388,36 @@ class GeoNTWrapper(nn.Module):
         # print("error", error[1, 200:210, 200:210], flow_norm[1, 200:210, 200:210], flow_final_est[1, 0, 200:210, 200:210])
         # print("info", info_[1, 200:210, 200:210])
 
-        # romav2 match
-        # match_preds = self.extract_matches(images, ii, jj)
-        # coords0_est = match_preds["warp_AB"]
-        # error = torch.norm(coords0_est.permute(0, 2, 3, 1) - coords0, dim=-1, keepdim=False)
-        # print("error", error[0, 0, 300:310, 300:310])
-        # print("warp_AB", coords0_est[0, :, 200:210, 200:210])
-        # ====
-
-        # Monocular depth prior
-        fx = intrinsics[0, :, 0]
-        fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
-        depth_predictions = self.mono.infer(images[0], fov_x=fov_x)
+        # Front end
+        flow_predictions, depth_predictions = self._frontend_forward(images, intrinsics, graph)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
         scaled_depth, scale = self.normalize_depth(mono_depths.clone(), valid)
+
+        flows, infos = flow_predictions["flow"], flow_predictions["info"]
+        flows = [flow_predictions["init"]] + flows
+        infos = [infos[0]] + infos
+
+        if self.training:
+            idx = torch.randint(0, len(flows), size=(flows[0].shape[0],), dtype=torch.long)
+            flows_ = torch.stack(flows, dim=0)
+            infos_ = torch.stack(infos, dim=0)
+            range_idx = torch.arange(flows[0].shape[0])
+            flow_final = flows_[idx, range_idx]
+            info_final = infos_[idx, range_idx]
+        else:
+            flow_final = flows[-1]
+            info_final = infos[-1]
+
+        weight = torch.softmax(info_final[:, :2], dim=1)
+        raw_b = info_final[:, 2:]
+        log_b = torch.zeros_like(raw_b)
+        var_max, var_min = self.flow.args.var_max, self.flow.args.var_min
+        # Large b Component
+        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
+        # Small b Component
+        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
+        info = (torch.exp(-log_b) * weight).sum(dim=1)
+        i_weights = self.i_weights[idx] if self.training else None
 
         iu = torch.unique(ii)
         for fi in iu:
@@ -362,13 +427,14 @@ class GeoNTWrapper(nn.Module):
             flow_predictions = {
                 "final": flow_final[mask],
                 "info": info[mask],
+                "i_weights": i_weights[mask] if self.training else None,
             }
             depth_predictions = {
                 "depth": scaled_depth[fi],
                 "mask": valid[fi],
             }
 
-            output_geo = self.model(
+            output_geo = self.gnt(
                 flow_predictions,
                 depth_predictions,
                 intrinsics[0, fi],
@@ -380,12 +446,13 @@ class GeoNTWrapper(nn.Module):
             pose_graph[mask] = output_geo["pose_enc"]
 
         predictions = {
-            "pose_graph": pose_graph[None].squeeze(2),  # 1,E,7 in inference stage, 1,E,L,7 in training stage for auxiliary supervision
+            "pose_graph": pose_graph[None],  # 1,E,7
             "depth": depths[None].squeeze(2),  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
             "valid": valid[None],
             # "flow": flow_final,
             # "info": info,
             "scale": scale[None],  # (B,S)
+            "i_weights": i_weights[None] if self.training else None,  # (B,E)
         }
 
         return predictions

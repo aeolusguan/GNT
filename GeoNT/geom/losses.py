@@ -16,7 +16,7 @@ def pose_metrics(dE):
     return r_err, t_err, s_err
 
 
-def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
+def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale, weights):
     """ Loss function for training network """
 
     # relative pose
@@ -32,10 +32,13 @@ def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
 
     if isinstance(pose_est, SE3):
         tau, phi = d.split([3,3], dim=-1)
-        geodesic_loss = tau.norm(dim=-1).mean() + phi.norm(dim=-1).mean()
+        geodesic_loss = tau.norm(dim=-1) + phi.norm(dim=-1)
     elif isinstance(pose_est, Sim3):
         tau, phi, sig = d.split([3,3,1], dim=-1)
-        geodesic_loss += tau.norm(dim=-1).mean() + phi.norm(dim=-1).mean() + 0.05 * sig.norm(dim=-1).mean()
+        geodesic_loss = tau.norm(dim=-1) + phi.norm(dim=-1) + 0.05 * sig.norm(dim=-1)
+
+    geodesic_loss = geodesic_loss * weights
+    geodesic_loss = geodesic_loss.mean()
 
     dE = Sim3(pose_est * dP.inv()).detach()
     r_err, t_err, s_err = pose_metrics(dE)
@@ -50,7 +53,7 @@ def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
     return geodesic_loss, metrics
 
 
-def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid):
+def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid, weights):
     """ optical flow loss """
 
     N = gt_pose.shape[1]
@@ -62,7 +65,7 @@ def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid):
     coords1, val1 = projective_transform_v2(poses_est, disps_est, intrinsics, ii, jj)
     v = (val0 * val1).squeeze(dim=-1)
     epe = v * (coords1 - coords0).norm(dim=-1)
-    flow_loss = epe.mean()
+    flow_loss = (epe * weights[:, :, None, None]).mean()
 
     epe = epe.reshape(-1)[v.reshape(-1) > 0.5]
     metrics = {

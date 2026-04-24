@@ -48,9 +48,3 @@ def load_raft():
 def load_moge(version: str):
     model = import_model_class_by_version(version).from_pretrained("Ruicheng/moge-2-vitl")
     return model.eval()
-
-
-def load_romav2():
-    model = RoMaV2()
-    model.apply_setting("base")
-    return model
