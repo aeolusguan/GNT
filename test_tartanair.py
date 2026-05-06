@@ -143,7 +143,7 @@ def evaluate(predictions, batch):
 
     cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, torch.ones_like(scale), 1.0 / scale)
     # cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale)
-    flo_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
+    flo_loss, _, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
     
     pr_depth = pr_depth * scale[..., None, None]
     mono_pr_depth = mono_pr_depth * mono_scale[..., None, None]

@@ -4,18 +4,36 @@ import torch.nn.functional as F
 
 from .dinov2.dinov2 import DinoV2
 from .dinov2.layers import PatchEmbed
-from .heads.dpt_head import DPTHead
+#from .heads.dpt_head import DPTHead
 from .cam_dec import CameraDec
 from .heads.linear_head import LinearDepth
+from .heads.transformer_head import TransformerDecoder
+from .heads.custom_dpt_head import DPTHead
 
 from GeoNT.geom.graph_utils import graph_to_edge_list, keyframe_indices
-from ..external import load_moge, load_raft
+from ..external import load_moge, load_raft, ConvStack
 from ..flow.core.utils import InputPadder
 from ..flow import load_flow
 from GeoNT.geom.projective_ops import projective_transform
 from lietorch import SE3
 
+class resconv(nn.Module):
+    def __init__(self, inp, oup, k=3, s=1, p=0, act_layer=nn.SiLU):
+        super(resconv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(inp, oup, kernel_size=k, stride=s, padding=p, bias=True),
+            act_layer(inplace=True),
+            nn.Conv2d(oup, oup, kernel_size=k, stride=1, padding=p, bias=True),
+            act_layer(inplace=True),
+        )
+        if inp != oup or s != 1:
+            self.skip_conv = nn.Conv2d(inp, oup, kernel_size=1, stride=s, padding=0, bias=True)
+        else:
+            self.skip_conv = nn.Identity()
 
+    def forward(self, x):
+        return self.conv(x) + self.skip_conv(x)
+    
 def flow_jacobian(flow):
     """
     Compute spatial Jacobian of optical flow.
@@ -50,6 +68,52 @@ def flow_jacobian(flow):
     return jacobian
 
 
+class MotionPatchEmbed(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        patch_size,
+    ):
+        super().__init__()
+
+        self.motion_embed = PatchEmbed(in_chans=5, patch_size=patch_size, embed_dim=embed_dim, flatten_embedding=False)
+
+    def forward(self, motion_field, info, intrinsics, var_min, var_max):
+        # compute gate
+        weight = torch.softmax(info[:, :2], dim=1)
+        raw_b = info[:, 2:]
+        log_b = torch.zeros_like(raw_b)
+        # Large b Component
+        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
+        # Small b Component
+        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
+        info_final = (torch.exp(-log_b) * weight).sum(dim=1, keepdim=True)
+
+        # embed motion field
+        ht, wd = motion_field.shape[-2:]
+        fx, fy, cx, cy = intrinsics[..., None, None, :].unbind(dim=-1)
+        v, u = torch.meshgrid(
+            torch.arange(ht, device=motion_field.device, dtype=torch.float),
+            torch.arange(wd, device=motion_field.device, dtype=torch.float),
+            indexing="ij",
+        )
+        x, y = (u - cx) / fx, (v - cy) / fy
+
+        # make flow intrinsic-invariant
+        dx, dy = motion_field[:, 0] / fx, motion_field[:, 1] / fy
+
+        # flow jacobian
+        # jacobian = flow_jacobian(torch.stack((dx, dy), dim=1)) * 320
+
+        x = x.expand(dx.shape[0], -1, -1)
+        y = y.expand(dy.shape[0], -1, -1)
+
+        # motion field encoder
+        motion_token = self.motion_embed(torch.stack((x, y, dx * 50, dy * 50, info_final.squeeze(1)), dim=1))
+
+        return motion_token
+
+        
 class GeoNT(nn.Module):
     def __init__(self):
         super().__init__()
@@ -59,33 +123,59 @@ class GeoNT(nn.Module):
             out_layers=[5, 7, 9, 11],
             alt_start=4,
             qknorm_start=4,
-            rope_start=-1,
+            rope_start=4,
             cat_token=True,
         )
         self.embed_dim = self.backbone.pretrained.embed_dim
         self.patch_size = self.backbone.pretrained.patch_size
-        # self.depth_head = DPTHead(
-        #     dim_in=2*self.embed_dim,
-        #     patch_size=self.patch_size,
-        #     output_dim=2,
-        #     activation="exp",
-        #     conf_activation="sigmoid",
-        #     out_channels=[96, 192, 384, 768],
-        #     features=128,
-        # )
-        self.depth_head = LinearDepth(
+        self.depth_head = DPTHead(
+            dim_in=2*self.embed_dim,
             patch_size=self.patch_size,
-            dec_embed_dim=2*self.embed_dim,
+            output_dim=2,
             activation="exp",
+            conf_activation="sigmoid",
+            out_channels=[96, 192, 384],
+            features=128,
         )
+        # self.depth_head = LinearDepth(
+        #     patch_size=self.patch_size,
+        #     dec_embed_dim=2*self.embed_dim,
+        #     activation="exp",
+        # )
+        self.depth_head = TransformerDecoder(
+            in_dim=2*self.embed_dim,
+            patch_size=self.patch_size,
+            dec_embed_dim=512,
+            dec_num_heads=8,
+            output_dim=1,
+            depth=2,
+            activation="exp",
+            rope=self.backbone.pretrained.rope,
+        )
+        # self.depth_head = ConvStack(
+        #     dim_in=[768, 192, 96, 48],
+        #     dim_res_blocks=[768, 192, 96, 48],
+        #     dim_out=[None, None, None, 1],
+        #     resamplers=["conv_transpose", "conv_transpose", "conv_transpose"],
+        #     num_res_blocks=[0, 1, 1, 0],
+        #     res_block_in_norm="none",
+        #     res_block_hidden_norm="none",
+        # )
         self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3, flatten_embedding=False)
-        self.motion_patch_embed = PatchEmbed(in_chans=5, patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3, flatten_embedding=False)
+        self.motion_patch_embed = MotionPatchEmbed(patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
+        self.res_depth_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size//2, embed_dim=self.embed_dim, flatten_embedding=True)
+        # self.depth_resconv = nn.ModuleList(
+        #     [nn.Sequential(nn.Conv2d(2, 96, kernel_size=4, stride=4, padding=0), nn.SiLU()), resconv(96, 192, k=3, s=2, p=1)]
+        # )
+
+        
         self.cam_dec = CameraDec(dim_in=1536)
 
     def forward(
         self, 
         flow_predictions, 
-        depth_predictions, 
+        depth_predictions,
+        image, 
         intrinsics: torch.Tensor,
         export_feat_layers: list[int] | None = [],
         use_fp16: bool = False,
@@ -93,30 +183,9 @@ class GeoNT(nn.Module):
         # ---- motion tokenization ---- #
         flow = flow_predictions['final']
         flow_info = flow_predictions['info']
+        var_min, var_max = flow_predictions['var_min'], flow_predictions['var_max']
 
-        # normalized coordinate
-        ht, wd = flow.shape[-2:]
-        fx, fy, cx, cy = intrinsics[..., None, None, :].unbind(dim=-1)
-        v, u = torch.meshgrid(
-            torch.arange(ht, device=flow.device, dtype=torch.float),
-            torch.arange(wd, device=flow.device, dtype=torch.float),
-            indexing="ij",
-        )
-        x, y = (u - cx) / fx, (v - cy) / fy
-
-        # make flow intrinsic-invariant
-        dx, dy = flow[:, 0] / fx, flow[:, 1] / fy
-
-        # flow jacobian
-        # jacobian = flow_jacobian(torch.stack((dx, dy), dim=1)) * 320
-
-        x = x.expand(dx.shape[0], -1, -1)
-        y = y.expand(dy.shape[0], -1, -1)
-
-        # motion field encoder
-        motion_field = torch.stack((x, y, dx * 50, dy * 50, flow_info), dim=1)
-        # motion_field = torch.cat((motion_field, jacobian), dim=1)
-        motion_token = self.motion_patch_embed(motion_field)
+        motion_token = self.motion_patch_embed(flow, flow_info, intrinsics, var_min=var_min, var_max=var_max)
 
         # ---- depth tokenization ---- #
         depth = depth_predictions['depth']
@@ -124,23 +193,32 @@ class GeoNT(nn.Module):
         assert depth.ndim == 2
         depthmap = torch.stack([depth, mask.to(depth.dtype)], dim=0)[None]
         depth_token = self.depth_patch_embed(depthmap)
-
+        
         # expand the edge size
         depth_token = depth_token.expand(motion_token.shape[0], -1, -1, -1)
 
         patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,H,W,C]
+        # cam_token = self.cam_init(flow_predictions['net']).unsqueeze(1)  # [1,E,1,C]
 
         # multi-view transformer aggregation
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16):
             feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
 
         # process features through depth head
+        # d4 = self.depth_resconv[0](depthmap)
+        # d8 = self.depth_resconv[1](d4)
+        # feats = [d4, d8] + [feats[-1]]
+        #res_feat = self.res_depth_embed(torch.cat((depthmap, image[None]), dim=1))
+        res_feat = self.res_depth_embed(depthmap)
+        ht, wd = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth = self.depth_head(feats, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            depth = self.depth_head(feats, res_feat, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            # depth, depth_conf = self.depth_head(feats, H=ht, W=wd, patch_start_idx=0)
+            # depth = depth.squeeze(0)
             pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)  # E,7
 
         output = {
-            "depth": depth,  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            "depth": depth.squeeze(0),  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
             "pose_enc": pose_enc,  # E,L,7
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
@@ -323,7 +401,6 @@ class GeoNTWrapper(nn.Module):
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
 
-        images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
         B, S, _, H, W = images.shape
         assert B == 1
 
@@ -354,7 +431,7 @@ class GeoNTWrapper(nn.Module):
         flow_predictions = {
             "flow": [padder.unpad(x) for x in flow_predictions["flow"]],
             "info": [padder.unpad(x) for x in flow_predictions["info"]],
-            "init": padder.unpad(flow_predictions["init"]),
+            "prob_up": padder.unpad(flow_predictions["prob_up"]),
         }
 
         return flow_predictions, depth_predictions
@@ -366,9 +443,11 @@ class GeoNTWrapper(nn.Module):
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
 
+        images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
+
         L = self.gnt.num_out_layers if self.training else 1
         pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
-        depths = torch.zeros((images.shape[1], L, images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
+        depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # ====
         # gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
@@ -393,50 +472,28 @@ class GeoNTWrapper(nn.Module):
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
         scaled_depth, scale = self.normalize_depth(mono_depths.clone(), valid)
 
-        flows, infos = flow_predictions["flow"], flow_predictions["info"]
-        flows = [flow_predictions["init"]] + flows
-        infos = [infos[0]] + infos
-
-        if self.training:
-            idx = torch.randint(0, len(flows), size=(flows[0].shape[0],), dtype=torch.long)
-            flows_ = torch.stack(flows, dim=0)
-            infos_ = torch.stack(infos, dim=0)
-            range_idx = torch.arange(flows[0].shape[0])
-            flow_final = flows_[idx, range_idx]
-            info_final = infos_[idx, range_idx]
-        else:
-            flow_final = flows[-1]
-            info_final = infos[-1]
-
-        weight = torch.softmax(info_final[:, :2], dim=1)
-        raw_b = info_final[:, 2:]
-        log_b = torch.zeros_like(raw_b)
-        var_max, var_min = self.flow.args.var_max, self.flow.args.var_min
-        # Large b Component
-        log_b[:, 0] = torch.clamp(raw_b[:, 0], min=0, max=var_max)
-        # Small b Component
-        log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
-        info = (torch.exp(-log_b) * weight).sum(dim=1)
-        i_weights = self.i_weights[idx] if self.training else None
+        flow_final, info_final = flow_predictions["flow"][-1], flow_predictions["info"][-1]
 
         iu = torch.unique(ii)
         for fi in iu:
             torch.cuda.empty_cache()
             # collect edges connected to the keyframe
             mask = (ii == fi)
-            flow_predictions = {
+            flow_input = {
                 "final": flow_final[mask],
-                "info": info[mask],
-                "i_weights": i_weights[mask] if self.training else None,
+                "info": info_final[mask],
+                "var_min": self.flow.args.var_min,
+                "var_max": self.flow.args.var_max,
             }
-            depth_predictions = {
+            depth_input = {
                 "depth": scaled_depth[fi],
                 "mask": valid[fi],
             }
 
             output_geo = self.gnt(
-                flow_predictions,
-                depth_predictions,
+                flow_input,
+                depth_input,
+                images[0, fi],
                 intrinsics[0, fi],
                 export_feat_layers=[],
                 use_fp16=use_fp16,
@@ -447,12 +504,13 @@ class GeoNTWrapper(nn.Module):
 
         predictions = {
             "pose_graph": pose_graph[None],  # 1,E,7
-            "depth": depths[None].squeeze(2),  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
+            "depth": depths[None],  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
             "valid": valid[None],
             # "flow": flow_final,
             # "info": info,
             "scale": scale[None],  # (B,S)
-            "i_weights": i_weights[None] if self.training else None,  # (B,E)
+            "flow_predictions": flow_predictions,
+            "mono_depth": mono_depths[None],  # 1,S,H,W
         }
 
         return predictions

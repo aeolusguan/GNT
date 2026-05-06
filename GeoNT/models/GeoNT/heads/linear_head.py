@@ -17,7 +17,7 @@ class LinearDepth(nn.Module):
         self.activation = activation
 
         self.proj = nn.Sequential(
-            nn.Linear(dec_embed_dim, dec_embed_dim),
+            nn.Linear(dec_embed_dim+dec_embed_dim//2, dec_embed_dim),
             nn.ReLU(),
             nn.Linear(dec_embed_dim, dec_embed_dim),
             nn.ReLU(),
@@ -30,7 +30,7 @@ class LinearDepth(nn.Module):
             nn.Linear(dec_embed_dim, 1),
         )
 
-    def forward(self, aggregated_tokens_list, img_shape):
+    def forward(self, aggregated_tokens_list, res_feat, img_shape):
         B, S, N, C = aggregated_tokens_list[0][0].shape
         H, W = img_shape
         if not self.training:  # inference stage, only use the last layer's output
@@ -39,7 +39,7 @@ class LinearDepth(nn.Module):
         for aggregated_tokens in aggregated_tokens_list:
             gates = torch.softmax(self.gate(aggregated_tokens[0]), dim=1)
             feat = (aggregated_tokens[0] * gates).sum(dim=1)  # B,N,C
-            feat = self.proj(feat)  # B,N,patch_size**2
+            feat = self.proj(torch.cat((feat, res_feat), dim=-1))  # B,N,patch_size**2
             feat = feat.transpose(-1, -2).view(B, -1, H//self.patch_size, W//self.patch_size)
             feat = nn.functional.pixel_shuffle(feat, self.patch_size)  # B,1,H,W
             preds = self._apply_activation_single(feat, self.activation)

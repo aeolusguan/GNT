@@ -26,6 +26,8 @@ class FlowModel(nn.Module):
         self.args.corr_radius = args.radius
         self.args.corr_channel = args.corr_levels * (args.radius * 2 + 1) ** 2
 
+        self.n_bins = 41
+
         self.merge_head = nn.Sequential(
             nn.Conv2d(64, 64, 3, stride=2, padding=1),
             nn.ReLU(inplace=True),
@@ -38,7 +40,8 @@ class FlowModel(nn.Module):
         hidden_dim = 64
         self.init_decoder = ViTInit(model_name='vits', input_dim=hidden_dim)
         self.init_proj = Mlp(2*(args.dim + 128), hidden_dim, hidden_dim, use_conv=True)
-        self.init_pred_head = Mlp(hidden_dim, hidden_dim, 8*8*2, use_conv=True)
+        self.init_bin_head = Mlp(hidden_dim, hidden_dim, self.n_bins*2, use_conv=True)
+        self.init_mask_head = Mlp(hidden_dim, hidden_dim, 8*8*9, use_conv=True)
         self.net_init = nn.Conv2d(hidden_dim, args.dim, 1, 1, 0)
 
         self.upsample_weight = nn.Sequential(
@@ -121,6 +124,38 @@ class FlowModel(nn.Module):
 
         return up_flow.reshape(N, 2, 8*H, 8*W), up_info.reshape(N, C, 8*H, 8*W)
     
+    def convex_upsample(self, data, mask):
+        N, C, H, W = data.shape
+        mask = mask.view(N, 1, 9, 8, 8, H, W)
+        mask = torch.softmax(mask, dim=2)
+        up_data = F.unfold(data, [3,3], padding=1)
+        up_data = up_data.view(N, C, 9, 1, 1, H, W)
+        up_data = torch.sum(mask * up_data, dim=2)
+        up_data = up_data.permute(0, 1, 4, 2, 5, 3)
+        return up_data.reshape(N, C, 8*H, 8*W)
+    
+    def init_pred(self, init_bins_logits, idx_bins):
+        soft_argmax_threshold = 3
+        softmax_temperature = 1.0
+        argmax_x = init_bins_logits[:, :self.n_bins].argmax(
+            dim=1, keepdim=True
+        )
+        index = torch.arange(self.n_bins, device=init_bins_logits.device).view(1, -1, 1, 1)
+        mask = (torch.abs(argmax_x - index) <= soft_argmax_threshold).float()
+        probs = F.softmax(init_bins_logits[:, :self.n_bins] * softmax_temperature, dim=1) * mask
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        init_x = torch.sum(probs * idx_bins, dim=1)
+
+        argmax_y = init_bins_logits[:, self.n_bins:].argmax(
+            dim=1, keepdim=True
+        )
+        mask = (torch.abs(argmax_y - index) <= soft_argmax_threshold).float()
+        probs = F.softmax(init_bins_logits[:, self.n_bins:] * softmax_temperature, dim=1) * mask
+        probs = probs / probs.sum(dim=1, keepdim=True)
+        init_y = torch.sum(probs * idx_bins, dim=1)
+
+        return torch.stack([init_x, init_y], dim=1)
+
     def forward(self, image1, image2, disp, mono1, mono2, iters=None, flow_gt=None, test_mode=False):
         """ Estimate optical flow between pair of frames """
         if iters is None:
@@ -145,21 +180,27 @@ class FlowModel(nn.Module):
         fmap1_8x = self.fnet(image1)
         fmap2_8x = self.fnet(image2)
         
-
         mono1 = self.merge_head(mono1)
         mono2 = self.merge_head(mono2)
 
         fmap1_8x = torch.cat((fmap1_8x, mono1), 1)
         fmap2_8x = torch.cat((fmap2_8x, mono2), 1)
 
+        idx_bins = torch.linspace(-16, 16, self.n_bins, device=fmap1_8x.device, dtype=fmap1_8x.dtype).view(1, self.n_bins, 1, 1)
+
         # Initialization
         x = self.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
         x, net = self.init_decoder(x, bases)
-        init = self.init_pred_head(x)
+        init_bins = self.init_bin_head(x)
+        init_mask = .25 * self.init_mask_head(x)
+        prob_up = self.convex_upsample(init_bins, init_mask)
+        prob_up = padder.unpad(prob_up)
+        flow_8x = self.init_pred(init_bins, idx_bins)
         net = self.net_init(net)
-        init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
-        flow_8x = torch.median(init, dim=2, keepdim=False)[0]
-        init = padder.unpad(einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8))
+
+        # init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
+        # flow_8x = torch.median(init, dim=2, keepdim=False)[0]
+        # init = padder.unpad(einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8))
         
         if iters > 0:
             corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
@@ -207,9 +248,9 @@ class FlowModel(nn.Module):
                 nf_loss = torch.logsumexp(weight, dim=1, keepdim=True) - torch.logsumexp(term1.unsqueeze(1) - term2, dim=2)
                 nf_predictions.append(nf_loss)
 
-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions, 'init': init * 8}
+            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions}
         else:
-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None, 'init': init * 8}
+            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None}
         
     def forward_with_fmap(self, fmap1_8x, fmap2_8x, bases, iters=None):
         """ Estimate optical flow between pair of frames """
@@ -220,13 +261,15 @@ class FlowModel(nn.Module):
         dilation = torch.ones(N, 1, H, W, device=fmap1_8x.device)
 
         # Initialization
+        idx_bins = torch.linspace(-16, 16, self.n_bins, device=fmap1_8x.device, dtype=fmap1_8x.dtype).view(1, self.n_bins, 1, 1)
+
         x = self.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
         x, net = self.init_decoder(x, bases)
-        init = self.init_pred_head(x)
+        init_bins = self.init_bin_head(x)
+        init_mask = .25 * self.init_mask_head(x)
+        prob_up = self.convex_upsample(init_bins, init_mask)
+        flow_8x = self.init_pred(init_bins, idx_bins)
         net = self.net_init(net)
-        init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
-        flow_8x = torch.median(init, dim=2, keepdim=False)[0]
-        init = einops.rearrange(init, 'b c (sh sw) h w -> b c (h sh) (w sw)', sh=8, sw=8)
         
         if iters > 0:
             corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
@@ -248,4 +291,4 @@ class FlowModel(nn.Module):
             flow_predictions.append(flow_up)
             info_predictions.append(info_up)
 
-        return {'flow': flow_predictions, 'info': info_predictions, 'init': init * 8}
+        return {'flow': flow_predictions, 'info': info_predictions, 'prob_up': prob_up}

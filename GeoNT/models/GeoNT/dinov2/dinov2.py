@@ -47,8 +47,8 @@ class DinoV2(nn.Module):
         encoder_fn = encoder_map[self.name]
         ffn_layer = "swiglufused" if self.name == "vitg" else "mlp"
         self.pretrained = encoder_fn(
-            img_size=518,
-            patch_size=14,
+            img_size=512,
+            patch_size=16,
             ffn_layer=ffn_layer,
             alt_start=alt_start,
             qknorm_start=qknorm_start,

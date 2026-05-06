@@ -299,10 +299,10 @@ def load_model(args, model_without_ddp, optimizer, loss_scaler):
             checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         print("Resume checkpoint %s" % args.resume)
         model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        args.start_epoch = checkpoint['epoch'] + 1
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scaler' in checkpoint:
-            loss_scaler.load_state_dict(checkpoint['scaler'])
+        # args.start_epoch = checkpoint['epoch'] + 1
+        # optimizer.load_state_dict(checkpoint['optimizer'])
+        # if 'scaler' in checkpoint:
+        #     loss_scaler.load_state_dict(checkpoint['scaler'])
         print("With optim & sched! start_epoch={:d}".format(args.start_epoch), end='')
 
 

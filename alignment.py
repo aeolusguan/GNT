@@ -2,7 +2,6 @@ from typing import *
 import math
 
 import torch
-import utils3d
 
 
 def scatter_min(size: int, dim: int, index: torch.LongTensor, src: torch.Tensor) -> torch.return_types.min:

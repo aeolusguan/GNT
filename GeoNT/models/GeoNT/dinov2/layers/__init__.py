@@ -11,6 +11,8 @@ from .mlp import Mlp
 from .patch_embed import PatchEmbed, make_2tuple
 from .rope import PositionGetter, RotaryPositionEmbedding2D
 from .swiglu_ffn import SwiGLUFFN, SwiGLUFFNFused
+from .attention import Attention
+from .drop_path import DropPath
 
 __all__ = [
     Mlp,
@@ -19,9 +21,10 @@ __all__ = [
     SwiGLUFFNFused,
     Block,
     GiTBlock,
-    # MemEffAttention,
+    Attention,
     LayerScale,
     PositionGetter,
     RotaryPositionEmbedding2D,
+    DropPath,
     make_2tuple,
 ]

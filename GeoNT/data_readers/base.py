@@ -15,7 +15,7 @@ from .rgbd_utils import *
 class RGBDDataset(EasyDataset):
     z_far = 0
 
-    def __init__(self, name, datapath, n_frames=4, crop_size=[378, 518], fmin=8.0, fmax=75.0, do_aug=True):
+    def __init__(self, name, datapath, n_frames=4, crop_size=[384, 512], fmin=8.0, fmax=75.0, do_aug=True):
         """ Base class for RGBD dataset """
         self.aug = None
         self.root = datapath

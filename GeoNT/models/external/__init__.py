@@ -9,6 +9,7 @@ import torch
 
 from .raft import RAFT, InputPadder
 from .moge import import_model_class_by_version
+from .moge.modules import ConvStack
 
 
 def load_raft():

@@ -58,12 +58,16 @@ def get_args_parser():
     parser.add_argument('--n_frames', type=int, default=7)
     parser.add_argument('--edges', type=int, default=24)
     parser.add_argument('--datapath', default='datasets/TartanAir', help="path to dataset directory")
-    parser.add_argument('--w_pose', type=float, default=5.0)
-    parser.add_argument('--w_flow', type=float, default=0.05)
-    parser.add_argument('--w_depth', type=float, default=1.0)
+    parser.add_argument('--w_pose', type=float, default=5.0)#5.0
+    parser.add_argument('--w_flow', type=float, default=0.05)#0.05
+    parser.add_argument('--w_depth', type=float, default=1.0)#1.0
     parser.add_argument('--w_depth_aux', type=float, nargs='+', default=[0.1, 0.3, 0.5], 
                         help="weights for auxiliary depth losses, should be a list of length num_out_layers-1")
+    parser.add_argument('--w_front_flow', type=float, default=1.0)
     parser.add_argument('--depth_valid_range', type=float, default=0.98)
+    parser.add_argument('--var_min', type=float, default=0.0)
+    parser.add_argument('--var_max', type=float, default=10.0)
+    parser.add_argument('--gamma', type=float, default=0.8, help="weight decay for intermediate flow losses")
 
     # others
     parser.add_argument('--num_workers', default=8, type=int)
@@ -237,12 +241,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         images, poses, depths, depths_valid, intrinsics = [x.to(device) for x in batch]
 
         # randomize frame graph
-        if np.random.rand() < 0.5:
-            graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
-        else:
-            graph = OrderedDict()
-            for i in range(args.n_frames):
-                graph[i] = [j for j in range(args.n_frames) if i!=j and abs(i-j) <= 2]
+        # if np.random.rand() < 0.5:
+        graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
+        # else:
+        #     graph = OrderedDict()
+        #     for i in range(args.n_frames):
+        #         graph[i] = [j for j in range(args.n_frames) if i!=j and abs(i-j) <= 2]
 
         prediction = model(images, intrinsics, graph, depths, depths_valid, poses, use_fp16=bool(args.amp))
 
