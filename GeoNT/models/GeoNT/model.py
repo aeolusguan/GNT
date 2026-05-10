@@ -215,11 +215,12 @@ class GeoNT(nn.Module):
             depth = self.depth_head(feats, res_feat, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
             # depth, depth_conf = self.depth_head(feats, H=ht, W=wd, patch_start_idx=0)
             # depth = depth.squeeze(0)
-            pose_enc = self.cam_dec(feats[-1][1]).squeeze(0)  # E,7
+            pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])  # 1,E,7, 1,E,2
 
         output = {
             "depth": depth.squeeze(0),  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
-            "pose_enc": pose_enc,  # E,L,7
+            "pose_enc": pose_enc.squeeze(0),  # E,7
+            "pose_log_variance": pose_log_variance.squeeze(0),  # E,2
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
         
@@ -447,6 +448,7 @@ class GeoNTWrapper(nn.Module):
 
         L = self.gnt.num_out_layers if self.training else 1
         pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
+        pose_graph_log_variance = torch.zeros((ii.shape[0], 2), device=images.device, dtype=torch.float32)
         depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # ====
@@ -501,9 +503,11 @@ class GeoNTWrapper(nn.Module):
 
             depths[fi] = output_geo["depth"]
             pose_graph[mask] = output_geo["pose_enc"]
+            pose_graph_log_variance[mask] = output_geo["pose_log_variance"]
 
         predictions = {
             "pose_graph": pose_graph[None],  # 1,E,7
+            "pose_graph_log_variance": pose_graph_log_variance[None],  # 1,E,2
             "depth": depths[None],  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
             "valid": valid[None],
             # "flow": flow_final,

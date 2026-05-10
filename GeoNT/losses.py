@@ -61,7 +61,7 @@ def normalize_depth(depth, valid, eps=1e-8):
     return nan_depth / scale_factor[:, None, None], scale_factor
 
 
-def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1"):
+def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", log_variance=None):
     """
     Compute translation, rotation for a batch of pose encodings.
 
@@ -69,6 +69,8 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1"):
         pred_pose_enc: (N, D) predicted pose encoding
         gt_pose_enc: (N, D) ground truth pose encoding
         loss_type: "l1" (abs error) or "l2" (euclidean error)
+        log_variance: (N,2) predicted log-variance for the 6D pose residual. Only one translational confidence and 
+            one rotational confidence per relative pose.
     Returns:
         loss_T: translation loss (mean)
         loss_R: rotation loss (mean)
@@ -78,12 +80,12 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     """
     if loss_type == "l1":
         # Translation: first 3 dims; Rotation: next 4 (quaternion)
-        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).abs()
-        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).abs()
+        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).abs().sum(dim=-1, keepdim=True)
+        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).abs().sum(dim=-1, keepdim=True)
     elif loss_type == "l2":
         # L2 norm for each component
         loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).norm(dim=-1, keepdim=True)
-        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).norm(dim=-1)
+        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).norm(dim=-1, keepdim=True)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
     
@@ -91,8 +93,13 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1"):
     loss_T = check_and_fix_inf_nan(loss_T, "loss_T")
     loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
 
+    loss_T = loss_T.clamp(max=100)
+    if log_variance is not None:
+        loss_T = loss_T * torch.exp(-log_variance[..., :1]) + log_variance[..., :1]
+        loss_R = loss_R * torch.exp(-log_variance[..., 1:2]) + log_variance[..., 1:2]
+
     # Clamp outlier translation loss to prevent instability, then average
-    loss_T = loss_T.clamp(max=100).mean()
+    loss_T = loss_T.mean()
     loss_R = loss_R.mean()
 
     return loss_T, loss_R
@@ -117,6 +124,7 @@ class MultitaskLoss(torch.nn.Module):
         """
         pr_depth = predictions["depth"].clip(max=100, min=1e-3)
         pr_rel_poses = SE3(predictions["pose_graph"])
+        pr_rel_poses_log_variance = predictions["pose_graph_log_variance"]
         gt_depth = batch["depth"]
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
 
@@ -132,9 +140,7 @@ class MultitaskLoss(torch.nn.Module):
 
         intrinsics = batch["intrinsics"]
 
-        cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale)
-        cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
-        cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale)
+        cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale, pr_rel_poses_log_variance)
         flo_loss, front_flow_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask, flow_predictions=predictions["flow_predictions"], args=self.args)
         flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
 
@@ -174,7 +180,7 @@ class MultitaskLoss(torch.nn.Module):
         return total_loss, geo_metrics, flo_metrics, depth_metrics
         #return total_loss, {}, flo_metrics, {}
     
-    def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale):
+    def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale, pr_rel_pose_log_variance):
         # relative pose
         ii, jj, kk = graph_to_edge_list(graph)
         dP = gt_pose[:,jj] * gt_pose[:,ii].inv()
@@ -183,7 +189,7 @@ class MultitaskLoss(torch.nn.Module):
         dP = dP.scale(1.0 / gt_scale[:, ii])
         pr_rel_poses = pr_rel_poses.scale(1.0 / pr_scale[:, ii])
 
-        loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data)
+        loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data, log_variance=pr_rel_pose_log_variance)
         cam_loss = loss_T + loss_R
 
         dE = Sim3(pr_rel_poses * dP.inv()).detach()
