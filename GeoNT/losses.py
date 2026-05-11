@@ -123,6 +123,7 @@ class MultitaskLoss(torch.nn.Module):
             Dict containing individual losses and total objective
         """
         pr_depth = predictions["depth"].clip(max=100, min=1e-3)
+        pr_depth_conf = predictions["depth_conf"]
         pr_rel_poses = SE3(predictions["pose_graph"])
         pr_rel_poses_log_variance = predictions["pose_graph_log_variance"]
         gt_depth = batch["depth"]
@@ -160,8 +161,10 @@ class MultitaskLoss(torch.nn.Module):
         # print(gt_depth[0, ii[2], 230:240, 360:370])
         #print(predictions["info"][2, 230:240, 360:370])
 
-        depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
-        depth_loss = depth_grad_loss + depth_reg_loss
+        # NOTE: we put conf inside compute_depth_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
+        # this is hacky, but very easier to implement
+        depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, pr_depth_conf, valid_mask)
+        depth_loss = depth_grad_loss + depth_conf_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
 
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss + self.args.w_front_flow * front_flow_loss
@@ -204,20 +207,14 @@ class MultitaskLoss(torch.nn.Module):
 
         return cam_loss, metrics
     
-    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, valid_mask):
+    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, depth_conf, valid_mask, alpha=0.2):
         # Compute L1 loss between predicted and ground truth points
         depth_reg_loss = torch.abs(normed_pr_depth - normed_gt_depth)
         depth_reg_loss = depth_reg_loss[valid_mask]
-        depth_reg_loss = check_and_fix_inf_nan(depth_reg_loss, "depth_reg_loss")
-        # Process regular regression loss
-        if depth_reg_loss.numel() > 0:
-            # Filter out outliers using quantile-based thresholding
-            if self.args.depth_valid_range > 0:
-                depth_reg_loss = filter_by_quantile(depth_reg_loss, self.args.depth_valid_range)
-            
-            depth_reg_loss = depth_reg_loss.mean()
-        else:
-            depth_reg_loss = (0.0 * normed_pr_depth).mean()
+
+        # Confidence-weighted loss: loss * conf - alpha * log(conf)
+        depth_conf_loss = depth_reg_loss * depth_conf[valid_mask] - alpha * torch.log(depth_conf[valid_mask])
+        depth_conf_loss = check_and_fix_inf_nan(depth_conf_loss, "depth_conf_loss")
 
         depth_grad_loss = gradient_loss_multi_scale_wrapper(
             normed_pr_depth.flatten(0, 1).unsqueeze(-1),
@@ -227,7 +224,27 @@ class MultitaskLoss(torch.nn.Module):
         )
         depth_grad_loss = check_and_fix_inf_nan(depth_grad_loss, "depth_grad_loss")
 
-        return depth_reg_loss, depth_grad_loss
+        # Process confidence-weighted loss
+        if depth_conf_loss.numel() > 0:
+            # Filter out outliers using quantile-based thresholding
+            if self.args.depth_valid_range > 0:
+                depth_conf_loss = filter_by_quantile(depth_conf_loss, self.args.depth_valid_range)
+            
+            depth_conf_loss = depth_conf_loss.mean()
+        else:
+            depth_conf_loss = (0.0 * normed_pr_depth).mean()
+
+        # Process regular regression loss
+        if depth_reg_loss.numel() > 0:
+            # Filter out outliers using quantile-based thresholding
+            if self.args.depth_valid_range > 0:
+                depth_reg_loss = filter_by_quantile(depth_reg_loss, self.args.depth_valid_range)
+
+            depth_reg_loss = depth_reg_loss.mean()
+        else:
+            depth_reg_loss = (0.0 * normed_pr_depth).mean()
+
+        return depth_conf_loss, depth_grad_loss, depth_reg_loss
 
 
 def gradient_loss_multi_scale_wrapper(prediction, target, mask,scales=4, gradient_loss_fn = None, conf=None):
@@ -251,7 +268,7 @@ def gradient_loss_multi_scale_wrapper(prediction, target, mask,scales=4, gradien
             prediction[:, ::step, ::step],
             target[:, ::step, ::step],
             mask[:, ::step, ::step],
-            None if conf is None else conf[:, ::step, ]
+            None if conf is None else conf[:, ::step, ::step]
         )
     
     total = total / scales

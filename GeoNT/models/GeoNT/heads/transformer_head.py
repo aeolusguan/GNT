@@ -125,6 +125,7 @@ class TransformerDecoder(nn.Module):
         patch_size,
         output_dim=1,
         activation: str = "inv_log",
+        conf_activation: str = "expp1",
         dec_embed_dim=512,
         depth=5,
         dec_num_heads=8,
@@ -143,6 +144,7 @@ class TransformerDecoder(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.patch_size = patch_size
         self.activation = activation
+        self.conf_activation = conf_activation
 
         self.blocks = nn.ModuleList([
             Block(
@@ -199,9 +201,11 @@ class TransformerDecoder(nn.Module):
                 hidden = blk(hidden, pos=pos)
         out = self.linear_out(hidden)
         out = out.transpose(-1, -2).view(B, -1, H//patch_size, W//patch_size)
-        out = nn.functional.pixel_shuffle(out, patch_size)  # B,1,H,W
-        pred = self._apply_activation_single(out, activation=self.activation)
-        return pred
+        out = nn.functional.pixel_shuffle(out, patch_size)  # B,C,H,W
+        out = out.permute(0, 2, 3, 1)  # B,H,W,C
+        pred = self._apply_activation_single(out[..., :-1], activation=self.activation)
+        conf = self._apply_activation_single(out[..., -1], activation=self.conf_activation)
+        return pred.squeeze(-1), conf
     
     def _apply_activation_single(
         self, x: torch.Tensor, activation: str = "linear"

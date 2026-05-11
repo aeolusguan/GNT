@@ -128,15 +128,15 @@ class GeoNT(nn.Module):
         )
         self.embed_dim = self.backbone.pretrained.embed_dim
         self.patch_size = self.backbone.pretrained.patch_size
-        self.depth_head = DPTHead(
-            dim_in=2*self.embed_dim,
-            patch_size=self.patch_size,
-            output_dim=2,
-            activation="exp",
-            conf_activation="sigmoid",
-            out_channels=[96, 192, 384],
-            features=128,
-        )
+        # self.depth_head = DPTHead(
+        #     dim_in=2*self.embed_dim,
+        #     patch_size=self.patch_size,
+        #     output_dim=2,
+        #     activation="exp",
+        #     conf_activation="sigmoid",
+        #     out_channels=[96, 192, 384],
+        #     features=128,
+        # )
         # self.depth_head = LinearDepth(
         #     patch_size=self.patch_size,
         #     dec_embed_dim=2*self.embed_dim,
@@ -147,9 +147,10 @@ class GeoNT(nn.Module):
             patch_size=self.patch_size,
             dec_embed_dim=512,
             dec_num_heads=8,
-            output_dim=1,
+            output_dim=2,
             depth=2,
             activation="exp",
+            conf_activation="expp1",
             rope=self.backbone.pretrained.rope,
         )
         # self.depth_head = ConvStack(
@@ -175,7 +176,6 @@ class GeoNT(nn.Module):
         self, 
         flow_predictions, 
         depth_predictions,
-        image, 
         intrinsics: torch.Tensor,
         export_feat_layers: list[int] | None = [],
         use_fp16: bool = False,
@@ -212,13 +212,14 @@ class GeoNT(nn.Module):
         res_feat = self.res_depth_embed(depthmap)
         ht, wd = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth = self.depth_head(feats, res_feat, img_shape=(ht, wd)).squeeze(0)  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))  # 1,H,W
             # depth, depth_conf = self.depth_head(feats, H=ht, W=wd, patch_start_idx=0)
             # depth = depth.squeeze(0)
             pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])  # 1,E,7, 1,E,2
 
         output = {
-            "depth": depth.squeeze(0),  # L,H,W (L=1 in inference stage, L=num_layers in training stage for auxiliary supervision)
+            "depth": depth.squeeze(0),  # H,W
+            "depth_conf": depth_conf.squeeze(0),  # H,W
             "pose_enc": pose_enc.squeeze(0),  # E,7
             "pose_log_variance": pose_log_variance.squeeze(0),  # E,2
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
@@ -450,6 +451,7 @@ class GeoNTWrapper(nn.Module):
         pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
         pose_graph_log_variance = torch.zeros((ii.shape[0], 2), device=images.device, dtype=torch.float32)
         depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
+        depths_conf = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # ====
         # gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
@@ -495,20 +497,21 @@ class GeoNTWrapper(nn.Module):
             output_geo = self.gnt(
                 flow_input,
                 depth_input,
-                images[0, fi],
                 intrinsics[0, fi],
                 export_feat_layers=[],
                 use_fp16=use_fp16,
             )
 
             depths[fi] = output_geo["depth"]
+            depths_conf[fi] = output_geo["depth_conf"]
             pose_graph[mask] = output_geo["pose_enc"]
             pose_graph_log_variance[mask] = output_geo["pose_log_variance"]
 
         predictions = {
             "pose_graph": pose_graph[None],  # 1,E,7
             "pose_graph_log_variance": pose_graph_log_variance[None],  # 1,E,2
-            "depth": depths[None],  # 1,S,H,W in inference stage, 1,S,L,H,W in training stage
+            "depth": depths[None],  # 1,S,H,W
+            "depth_conf": depths_conf[None],  # 1,S,H,W
             "valid": valid[None],
             # "flow": flow_final,
             # "info": info,
