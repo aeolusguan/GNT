@@ -261,15 +261,9 @@ class GeoNTWrapper(nn.Module):
         self.mono = load_moge('v2')
         self.gnt = GeoNT()
 
-        gamma = self.flow.args.gamma
-        i_weights = [0.1]
-        for i in range(self.flow.args.iters):
-            i_weights.append(gamma ** (self.flow.args.iters - i - 1))
-        self.register_buffer("i_weights", torch.tensor(i_weights, dtype=torch.float32))
+        self.freeze_model()
 
-        self.free_model()
-
-    def free_model(self):
+    def freeze_model(self):
         def _freeze_model(model):
             model = model.eval()
             for p in model.parameters():

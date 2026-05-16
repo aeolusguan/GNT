@@ -29,8 +29,10 @@ import GeoNT.utils.misc as misc
 from GeoNT.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 from alignment import align
-from GeoNT.geom.losses import geodesic_loss, flow_loss
-from lietorch import SE3
+from GeoNT.geom.losses import pose_metrics
+from GeoNT.geom.graph_utils import graph_to_edge_list
+from GeoNT.geom.projective_ops import projective_transform, projective_transform_v2
+from lietorch import SE3, Sim3
 import matplotlib
 
 
@@ -112,6 +114,48 @@ def load_model(args, device):
     return model.eval()
 
 
+def pose_errors(gt_pose, pose_est, graph, gt_scale, pr_scale):
+    """ Loss function for training network """
+
+    # relative pose
+    ii, jj, kk = graph_to_edge_list(graph)
+    dP = gt_pose[:,jj] * gt_pose[:,ii].inv()
+
+    # scale the relative poses
+    dP = dP.scale(1.0 / gt_scale[:, ii])
+    pose_est = pose_est.scale(1.0 / pr_scale[:, ii])
+
+    dE = Sim3(pose_est * dP.inv()).detach()
+    r_err, t_err, s_err = pose_metrics(dE)
+
+    metrics = {
+        'rot_error': r_err.mean().item(),
+        'tr_error': t_err.mean().item(),
+        'bad_rot': (r_err < .1).float().mean().item(),
+        'bad_tr': (t_err < .01).float().mean().item(),
+    }
+
+    return metrics
+
+def flow_errors(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid):
+    """ optical flow loss """
+
+    ii, jj, kk = graph_to_edge_list(graph)
+    coords0, val0 = projective_transform(gt_pose, disps, intrinsics, ii, jj)
+    val0 = val0 * valid[:, ii].float().unsqueeze(dim=-1)
+
+    coords1, val1 = projective_transform_v2(poses_est, disps_est, intrinsics, ii, jj)
+    v = (val0 * val1).squeeze(dim=-1)
+    epe = v * (coords1 - coords0).norm(dim=-1)
+
+    epe = epe.reshape(-1)[v.reshape(-1) > 0.5]
+    metrics = {
+        'f_error': epe.mean().item(),
+        '1px': (epe<1.0).float().mean().item(),
+    }
+
+    return metrics
+
 def evaluate(predictions, batch):
     pr_depth = predictions["depth"].flatten(0, 1)
     gt_depth = batch["depth"].flatten(0, 1)
@@ -127,8 +171,11 @@ def evaluate(predictions, batch):
         mono_pr_depth_masked = mono_pr_depth[i][valid_mask_flatten[i]]
         gt_depth_masked = gt_depth[i][valid_mask_flatten[i]]
         w = 1.0 / gt_depth_masked
-        scale[i], _, _ = align(pr_depth_masked, gt_depth_masked, w)
-        mono_scale[i], _, _ = align(mono_pr_depth_masked, gt_depth_masked, w)
+        if pr_depth_masked.numel() > 0:
+            scale[i], _, _ = align(pr_depth_masked, gt_depth_masked, w)
+            mono_scale[i], _, _ = align(mono_pr_depth_masked, gt_depth_masked, w)
+        else:
+            scale[i] = mono_scale[i] = 1.0
 
     pr_depth = pr_depth.view(*predictions["depth"].shape)
     gt_depth = gt_depth.view(*batch["depth"].shape)
@@ -141,9 +188,9 @@ def evaluate(predictions, batch):
 
     intrinsics = batch["intrinsics"]
 
-    cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, torch.ones_like(scale), 1.0 / scale)
+    geo_metrics = pose_errors(gt_pose, pr_rel_poses, graph, torch.ones_like(scale), 1.0 / scale)
     # cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale)
-    flo_loss, _, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
+    flo_metrics = flow_errors(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask)
     
     pr_depth = pr_depth * scale[..., None, None]
     mono_pr_depth = mono_pr_depth * mono_scale[..., None, None]

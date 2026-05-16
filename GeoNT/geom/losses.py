@@ -19,7 +19,7 @@ def pose_metrics(dE):
     return r_err, t_err, s_err
 
 
-def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
+def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale, conf):
     """ Loss function for training network """
 
     # relative pose
@@ -33,13 +33,10 @@ def geodesic_loss(gt_pose, pose_est, graph, gt_scale, pr_scale):
     # pose error
     d = (pose_est * dP.inv()).log()
 
-    if isinstance(pose_est, SE3):
-        tau, phi = d.split([3,3], dim=-1)
-        geodesic_loss = tau.norm(dim=-1) + phi.norm(dim=-1)
-    elif isinstance(pose_est, Sim3):
-        tau, phi, sig = d.split([3,3,1], dim=-1)
-        geodesic_loss = tau.norm(dim=-1) + phi.norm(dim=-1) + 0.05 * sig.norm(dim=-1)
-
+    tau, phi = d.split([3,3], dim=-1)
+    geodesic_loss = tau.norm(dim=-1) * conf[..., 0] - 0.01 * torch.log(conf[..., 0]) + \
+        phi.norm(dim=-1) * conf[..., 1] - 0.01 * torch.log(conf[..., 1])
+    
     geodesic_loss = geodesic_loss.mean()
 
     dE = Sim3(pose_est * dP.inv()).detach()
@@ -110,11 +107,8 @@ def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid, fl
             final_mask = (~torch.isnan(nf_loss.detach())) & (~torch.isinf(nf_loss.detach())) & (val0[0, :, None].squeeze(-1) > 0.5)
 
             front_flow_loss += i_weight * ((final_mask * nf_loss).sum() / final_mask.sum())
-
-            # if i == n_predictions - 1:
-            #     info = (torch.exp(-log_b) * torch.softmax(weight, dim=1)).sum(dim=1)
-            #     print(torch.sum((flow_gt - flow) ** 2, dim=1).sqrt()[val0[0].squeeze(-1) > 0.5].mean().item(), torch.sum(flow_gt**2, dim=1).sqrt()[val0[0].squeeze(-1) > 0.5].mean().item(),
-            #           (torch.sum((flow_gt - flow) ** 2, dim=1).sqrt() * info)[val0[0].squeeze(-1) > 0.5].mean().item())
+        
+        # Use confidence to weight initialization loss
         flow_gt_ = torch.clamp(flow_gt / 8.0, min=-16, max=16)
         n_bins = prob_up.shape[1] // 2
         idx_bins = torch.linspace(-16, 16, n_bins, device=flow_gt_.device, dtype=flow_gt_.dtype).view(1, n_bins, 1, 1)

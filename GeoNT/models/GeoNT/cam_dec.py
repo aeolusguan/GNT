@@ -40,4 +40,4 @@ class CameraDec(nn.Module):
         else:
             out_qvec = camera_encoding[..., 3:7]
         pos_enc = torch.cat([out_t, out_qvec], dim=-1)
-        return pos_enc, self.fc_s(feat).clamp(min=0)
+        return pos_enc, torch.exp(self.fc_s(feat)) + 1

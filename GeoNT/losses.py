@@ -61,7 +61,7 @@ def normalize_depth(depth, valid, eps=1e-8):
     return nan_depth / scale_factor[:, None, None], scale_factor
 
 
-def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", log_variance=None):
+def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", conf=None):
     """
     Compute translation, rotation for a batch of pose encodings.
 
@@ -69,7 +69,7 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", log_variance=None):
         pred_pose_enc: (N, D) predicted pose encoding
         gt_pose_enc: (N, D) ground truth pose encoding
         loss_type: "l1" (abs error) or "l2" (euclidean error)
-        log_variance: (N,2) predicted log-variance for the 6D pose residual. Only one translational confidence and 
+        conf: (N,2) predicted confidence for the 6D pose residual. Only one translational confidence and 
             one rotational confidence per relative pose.
     Returns:
         loss_T: translation loss (mean)
@@ -80,8 +80,8 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", log_variance=None):
     """
     if loss_type == "l1":
         # Translation: first 3 dims; Rotation: next 4 (quaternion)
-        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).abs().sum(dim=-1, keepdim=True)
-        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).abs().sum(dim=-1, keepdim=True)
+        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).abs().sum(dim=-1)
+        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).abs().sum(dim=-1)
     elif loss_type == "l2":
         # L2 norm for each component
         loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).norm(dim=-1, keepdim=True)
@@ -94,9 +94,9 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", log_variance=None):
     loss_R = check_and_fix_inf_nan(loss_R, "loss_R")
 
     loss_T = loss_T.clamp(max=100)
-    if log_variance is not None:
-        loss_T = loss_T * torch.exp(-log_variance[..., :1]) + log_variance[..., :1]
-        loss_R = loss_R * torch.exp(-log_variance[..., 1:2]) + log_variance[..., 1:2]
+    if conf is not None:
+        loss_T = loss_T * conf[..., 0] - 0.01 * torch.log(conf[..., 0])
+        loss_R = loss_R * conf[..., 1] - 0.01 * torch.log(conf[..., 1])
 
     # Clamp outlier translation loss to prevent instability, then average
     loss_T = loss_T.mean()
@@ -141,7 +141,10 @@ class MultitaskLoss(torch.nn.Module):
 
         intrinsics = batch["intrinsics"]
 
+        # cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale, pr_rel_poses_log_variance)
+        # cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
         cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale, pr_rel_poses_log_variance)
+        cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
         flo_loss, front_flow_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask, flow_predictions=predictions["flow_predictions"], args=self.args)
         flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
 
@@ -192,7 +195,7 @@ class MultitaskLoss(torch.nn.Module):
         dP = dP.scale(1.0 / gt_scale[:, ii])
         pr_rel_poses = pr_rel_poses.scale(1.0 / pr_scale[:, ii])
 
-        loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data, log_variance=pr_rel_pose_log_variance)
+        loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data, conf=pr_rel_pose_log_variance)
         cam_loss = loss_T + loss_R
 
         dE = Sim3(pr_rel_poses * dP.inv()).detach()
@@ -247,7 +250,7 @@ class MultitaskLoss(torch.nn.Module):
         return depth_conf_loss, depth_grad_loss, depth_reg_loss
 
 
-def gradient_loss_multi_scale_wrapper(prediction, target, mask,scales=4, gradient_loss_fn = None, conf=None):
+def gradient_loss_multi_scale_wrapper(prediction, target, mask, scales=4, gradient_loss_fn = None, conf=None):
     """
     Multi-scale gradient loss wrapper. Applies gradient loss at multiple scales by subsampling the input.
     This helps capture both fine and coarse spatial structures.
