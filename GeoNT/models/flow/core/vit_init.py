@@ -64,3 +64,15 @@ class ViTInit(nn.Module):
         hidden = rearrange(vit_x, 'b (h w) c -> b c h w', h=h, w=w)
         
         return self.hidden(hidden, x), self.net(hidden, x)
+
+    def forward_with_bases(self, x, vit_bases):
+        vit_x = self.patch_embed(x)
+        vit_x = torch.cat((vit_x, vit_bases), dim=1)
+
+        h, w = vit_x.shape[-2:]
+        vit_x = rearrange(vit_x, 'b c h w -> b (h w) c')
+        for blk in self.blks:
+            vit_x = blk(vit_x)
+        hidden = rearrange(vit_x, 'b (h w) c -> b c h w', h=h, w=w)
+        
+        return self.hidden(hidden, x), self.net(hidden, x)

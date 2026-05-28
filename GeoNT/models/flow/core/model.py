@@ -292,3 +292,40 @@ class FlowModel(nn.Module):
             info_predictions.append(info_up)
 
         return {'flow': flow_predictions, 'info': info_predictions, 'prob_up': prob_up}
+    
+    def infer(self, fmap1_8x, fmap2_8x, bases_embed, iters=None):
+        """ Estimate optical flow between pair of frames """
+        if iters is None:
+            iters = self.args.iters
+        
+        N, _, H, W = fmap1_8x.shape
+        dilation = torch.ones(N, 1, H, W, device=fmap1_8x.device)
+
+        # Initialization
+        idx_bins = torch.linspace(-16, 16, self.n_bins, device=fmap1_8x.device, dtype=fmap1_8x.dtype).view(1, self.n_bins, 1, 1)
+
+        x = self.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
+        x, net = self.init_decoder.forward_with_bases(x, bases_embed)
+        init_bins = self.init_bin_head(x)
+        flow_8x = self.init_pred(init_bins, idx_bins)
+        net = self.net_init(net)
+        
+        if iters > 0:
+            corr_fn = CorrBlock(fmap1_8x, fmap2_8x, self.args)
+
+        for itr in range(iters):
+            N, _, H, W = flow_8x.shape
+            flow_8x = flow_8x.detach()
+            coords2 = coords_grid(N, H, W, device=fmap1_8x.device) + flow_8x
+            corr = corr_fn(coords2, dilation=dilation)
+            net = self.update_block(net, corr, flow_8x)
+            flow_update = self.flow_head(net)
+            flow_8x = flow_8x + flow_update[:, :2]
+
+            if itr == iters - 1:
+                info_8x = flow_update[:, 2:]
+                weight_update = .25 * self.upsample_weight(net)
+                # upsample predictions
+                flow_up, info_up = self.upsample_data(flow_8x, info_8x, weight_update)
+
+        return flow_up, info_up
