@@ -78,14 +78,19 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", conf=None):
         NOTE: The VGGT paper uses smooth l1 loss, but we found l1 loss is more stable than smooth l1 and l2 loss.
         So here we use l1 loss.
     """
+    pred_q = pred_pose_enc[..., 3:7]
+    gt_q = gt_pose_enc[..., 3:7]
+    pred_q = torch.where((pred_q * gt_q).sum(dim=-1, keepdim=True) < 0, -pred_q, pred_q)
+    quat_residual = pred_q - gt_q
+
     if loss_type == "l1":
         # Translation: first 3 dims; Rotation: next 4 (quaternion)
         loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).abs().sum(dim=-1)
-        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).abs().sum(dim=-1)
+        loss_R = quat_residual.abs().sum(dim=-1)
     elif loss_type == "l2":
         # L2 norm for each component
-        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).norm(dim=-1, keepdim=True)
-        loss_R = (pred_pose_enc[..., 3:7] - gt_pose_enc[..., 3:7]).norm(dim=-1, keepdim=True)
+        loss_T = (pred_pose_enc[..., :3] - gt_pose_enc[..., :3]).norm(dim=-1)
+        loss_R = quat_residual.norm(dim=-1)
     else:
         raise ValueError(f"Unknown loss type: {loss_type}")
     
@@ -96,7 +101,7 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", conf=None):
     loss_T = loss_T.clamp(max=100)
     if conf is not None:
         loss_T = loss_T * conf[..., 0] - 0.01 * torch.log(conf[..., 0])
-        loss_R = loss_R * conf[..., 1] - 0.01 * torch.log(conf[..., 1])
+        loss_R = loss_R * conf[..., 1] - 0.05 * torch.log(conf[..., 1])
 
     # Clamp outlier translation loss to prevent instability, then average
     loss_T = loss_T.mean()

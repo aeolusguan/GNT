@@ -133,6 +133,10 @@ class FlowModel(nn.Module):
         up_data = torch.sum(mask * up_data, dim=2)
         up_data = up_data.permute(0, 1, 4, 2, 5, 3)
         return up_data.reshape(N, C, 8*H, 8*W)
+
+    def upsample_flow(self, flow, mask):
+        # Low-resolution flow is measured on the 1/8 grid; dense flow is in image pixels.
+        return self.convex_upsample(8.0 * flow, mask)
     
     def init_pred(self, init_bins_logits, idx_bins):
         soft_argmax_threshold = 3
@@ -196,6 +200,8 @@ class FlowModel(nn.Module):
         prob_up = self.convex_upsample(init_bins, init_mask)
         prob_up = padder.unpad(prob_up)
         flow_8x = self.init_pred(init_bins, idx_bins)
+        init_flow = self.upsample_flow(flow_8x, init_mask)
+        init_flow = padder.unpad(init_flow)
         net = self.net_init(net)
 
         # init = einops.rearrange(init, 'b (c sh sw) h w -> b c (sh sw) h w', sh=8, sw=8)
@@ -248,9 +254,9 @@ class FlowModel(nn.Module):
                 nf_loss = torch.logsumexp(weight, dim=1, keepdim=True) - torch.logsumexp(term1.unsqueeze(1) - term2, dim=2)
                 nf_predictions.append(nf_loss)
 
-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions}
+            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': nf_predictions, 'init': init_flow, 'prob_up': prob_up}
         else:
-            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None}
+            return {'final': flow_predictions[-1], 'flow': flow_predictions, 'info': info_predictions, 'nf': None, 'init': init_flow, 'prob_up': prob_up}
         
     def forward_with_fmap(self, fmap1_8x, fmap2_8x, bases, iters=None):
         """ Estimate optical flow between pair of frames """
@@ -269,6 +275,7 @@ class FlowModel(nn.Module):
         init_mask = .25 * self.init_mask_head(x)
         prob_up = self.convex_upsample(init_bins, init_mask)
         flow_8x = self.init_pred(init_bins, idx_bins)
+        init_flow = self.upsample_flow(flow_8x, init_mask)
         net = self.net_init(net)
         
         if iters > 0:
@@ -291,7 +298,7 @@ class FlowModel(nn.Module):
             flow_predictions.append(flow_up)
             info_predictions.append(info_up)
 
-        return {'flow': flow_predictions, 'info': info_predictions, 'prob_up': prob_up}
+        return {'flow': flow_predictions, 'info': info_predictions, 'prob_up': prob_up, 'init': init_flow}
     
     def infer(self, fmap1_8x, fmap2_8x, bases_embed, iters=None):
         """ Estimate optical flow between pair of frames """

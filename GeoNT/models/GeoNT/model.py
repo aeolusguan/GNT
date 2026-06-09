@@ -97,9 +97,12 @@ class GeoNT(nn.Module):
         flow_predictions, 
         depth_predictions,
         intrinsics: torch.Tensor,
-        export_feat_layers: list[int] | None = [],
+        export_feat_layers: list[int] | None = None,
         use_fp16: bool = False,
     ):
+        if export_feat_layers is None:
+            export_feat_layers = []
+
         # ---- motion tokenization ---- #
         flow = flow_predictions['final']
         flow_info = flow_predictions['info']
@@ -120,7 +123,7 @@ class GeoNT(nn.Module):
         patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,H,W,C]
 
         # multi-view transformer aggregation
-        with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16):
+        with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
             feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
 
         res_feat = self.res_depth_embed(depthmap)
@@ -133,11 +136,54 @@ class GeoNT(nn.Module):
             "depth": depth.squeeze(0),  # H,W
             "depth_conf": depth_conf.squeeze(0),  # H,W
             "pose_enc": pose_enc.squeeze(0),  # E,7
+            "pose_confidence": pose_log_variance.squeeze(0),  # E,2
             "pose_log_variance": pose_log_variance.squeeze(0),  # E,2
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
         
         return output
+
+    def forward_from_motion_tokens(
+        self,
+        motion_token: torch.Tensor,
+        depth_predictions,
+        intrinsics: torch.Tensor,
+        export_feat_layers: list[int] | None = None,
+        use_fp16: bool = False,
+    ):
+        """Run GeoNT from precomputed per-edge motion tokens.
+
+        Streaming inference stores motion tokens in the factor graph so
+        marginalization can finalize edges without re-running the flow frontend.
+        """
+        if export_feat_layers is None:
+            export_feat_layers = []
+
+        depth = depth_predictions["depth"]
+        mask = depth_predictions["mask"]
+        assert depth.ndim == 2
+        depthmap = torch.stack([depth, mask.to(depth.dtype)], dim=0)[None]
+        depth_token = self.depth_patch_embed(depthmap)
+        depth_token = depth_token.expand(motion_token.shape[0], -1, -1, -1)
+
+        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]
+
+        with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
+            feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
+
+        res_feat = self.res_depth_embed(depthmap)
+        ht, wd = depth.shape[-2:]
+        with torch.autocast(device_type=patch_token.device.type, enabled=False):
+            depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))
+            pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])
+
+        return {
+            "depth": depth.squeeze(0),
+            "depth_conf": depth_conf.squeeze(0),
+            "pose_enc": pose_enc.squeeze(0),
+            "pose_confidence": pose_log_variance.squeeze(0),
+            "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
+        }
 
     def _extract_auxiliary_features(
         self, feats: list[torch.Tensor], feat_layers: list[int], H: int, W: int
@@ -209,10 +255,9 @@ class GeoNTWrapper(nn.Module):
         """
         assert depth.shape == mask.shape, "mask and depth must have the same dimensions"
 
+        depth = depth.masked_fill(~mask, 0)
         scaled_depth = torch.zeros_like(depth)
         scale = depth.new_zeros((depth.shape[0],))
-        # invalid depth to zeros, required for MoGE
-        depth[~mask] = 0
         for b in range(depth.shape[0]):
             valid = depth[b][mask[b]]
             if valid.numel() == 0:
@@ -223,7 +268,11 @@ class GeoNTWrapper(nn.Module):
             scaled_depth[b] = depth_b
             scale[b] = mean
 
-        scale[scale==0] = scale[scale>0].mean()
+        valid_scale = scale > 0
+        if valid_scale.any():
+            scale[~valid_scale] = scale[valid_scale].mean()
+        else:
+            scale[:] = 1.0
 
         return scaled_depth, scale
 
@@ -265,6 +314,7 @@ class GeoNTWrapper(nn.Module):
             "flow": [padder.unpad(x) for x in flow_predictions["flow"]],
             "info": [padder.unpad(x) for x in flow_predictions["info"]],
             "prob_up": padder.unpad(flow_predictions["prob_up"]),
+            "init": padder.unpad(flow_predictions["init"]),
         }
 
         return flow_predictions, depth_predictions
@@ -305,7 +355,7 @@ class GeoNTWrapper(nn.Module):
         # Front end
         flow_predictions, depth_predictions = self._frontend_forward(images, intrinsics, graph)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
-        scaled_depth, scale = self.normalize_depth(mono_depths.clone(), valid)
+        scaled_depth, scale = self.normalize_depth(mono_depths, valid)
 
         flow_final, info_final = flow_predictions["flow"][-1], flow_predictions["info"][-1]
 
@@ -387,13 +437,31 @@ class GeoNTWrapper(nn.Module):
         x = self.flow.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
         x, net = self.flow.init_decoder.forward_with_bases(x, bases)
         init_bins = self.flow.init_bin_head(x)
+        init_mask = .25 * self.flow.init_mask_head(x)
 
         flow_8x = self.flow.init_pred(init_bins, idx_bins)
+        init_flow = self.flow.upsample_flow(flow_8x, init_mask) / 8.0
         net = self.flow.net_init(net)
 
-        return flow_8x, net
+        return init_flow, net
     
     def encode_flow(self, fmap1_8x, fmap2_8x, bases, intrinsics):
         flow, info = self.flow.infer(fmap1_8x, fmap2_8x, bases)
         motion_token = self.gnt.motion_patch_embed(flow, info, intrinsics, var_min=self.flow.args.var_min, var_max=self.flow.args.var_max)
         return motion_token
+
+    def refine_from_motion_tokens(
+        self,
+        motion_token: torch.Tensor,
+        depth: torch.Tensor,
+        mask: torch.Tensor,
+        intrinsics: torch.Tensor,
+        use_fp16: bool = False,
+    ):
+        return self.gnt.forward_from_motion_tokens(
+            motion_token,
+            {"depth": depth, "mask": mask},
+            intrinsics,
+            export_feat_layers=[],
+            use_fp16=use_fp16,
+        )

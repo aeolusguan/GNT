@@ -86,6 +86,7 @@ def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid, fl
         flows = flow_predictions['flow']
         infos = flow_predictions['info']
         prob_up = flow_predictions['prob_up']
+        init = flow_predictions['init']
         n_predictions = len(flows)
 
         front_flow_loss = 0.0
@@ -108,7 +109,12 @@ def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid, fl
 
             front_flow_loss += i_weight * ((final_mask * nf_loss).sum() / final_mask.sum())
         
-        # Use confidence to weight initialization loss
+        # Use confidence to weight initialization losses.
+        init_loss = torch.abs(init - flow_gt).sum(dim=1)
+        final_mask = (~torch.isnan(init_loss.detach())) & (~torch.isinf(init_loss.detach())) & (val0[0,].squeeze(-1) > 0.5)
+        info = (torch.exp(-log_b) * torch.softmax(weight, dim=1)).sum(dim=1).detach()
+        front_flow_loss += 0.5 * (init_loss * final_mask * info).sum() / final_mask.sum()
+
         flow_gt_ = torch.clamp(flow_gt / 8.0, min=-16, max=16)
         n_bins = prob_up.shape[1] // 2
         idx_bins = torch.linspace(-16, 16, n_bins, device=flow_gt_.device, dtype=flow_gt_.dtype).view(1, n_bins, 1, 1)
@@ -118,7 +124,6 @@ def flow_loss(gt_pose, disps, poses_est, disps_est, intrinsics, graph, valid, fl
         kl_loss_y = -(torch.log(torch.clamp(F.softmax(prob_up[:, n_bins:], dim=1), min=1e-6)) * label_y).sum(dim=1)
         kl_loss = kl_loss_x + kl_loss_y
         final_mask = (~torch.isnan(kl_loss.detach())) & (~torch.isinf(kl_loss.detach())) & (val0[0,].squeeze(-1) > 0.5)
-        info = (torch.exp(-log_b) * torch.softmax(weight, dim=1)).sum(dim=1).detach()
         front_flow_loss += 0.5 * (kl_loss * final_mask * info).sum() / final_mask.sum()
     else:
         front_flow_loss = None
