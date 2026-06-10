@@ -1,0 +1,34 @@
+streams:
+  instance: geont_runtime.streams.frame_dir_stream.FrameDirStreamList
+  base_path: ???
+  frame_start: 0
+  frame_end: -1
+  frame_skip: 1
+  cached: false
+
+pipeline:
+  instance: geont_runtime.pipeline.default.DefaultAnnotationPipeline
+  init: {}
+  post: {}
+  output:
+    path: outputs
+  slam:
+    ckpt_path: ???
+    intrinsics: ???
+    visualize: false
+    buffer: 512
+    filter_thresh: 2.5
+    warmup: 8
+    frontend_radius: 2
+    frontend_thresh: 16.0
+    max_factors: 256
+    seq_init: false
+    pgo_iters: 12
+    pgo_damping: 1.0e-3
+    pgo_lm_max_attempts: 5
+    pgo_huber_delta: 1.0
+    pgo_scale_conf: 0.01
+    pgo_mode: se3_scale
+    pgo_rotation_only: false
+    pgo_backend: cuda_eigen
+    use_fp16: true

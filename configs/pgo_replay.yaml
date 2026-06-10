@@ -1,0 +1,13 @@
+graph: outputs/tartanair_pgo_eval/scene/pgo_replay_graph.npz
+output: outputs/pgo_replay/result.npz
+
+backend: cuda_eigen
+device: auto
+mode: se3_scale
+rotation_only: false
+iters: 12
+damping: 1.0e-3
+lm_max_attempts: 5
+huber_delta: 0.05
+scale_conf: 0.01
+repeat: 1

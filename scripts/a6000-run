@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+host="${A6000_HOST:-A6000}"
+repo="${A6000_REPO:-/data/disk_7t/tongfan/GNT}"
+conda_sh="${A6000_CONDA_SH:-/data/disk_7t/tongfan/miniconda3/etc/profile.d/conda.sh}"
+conda_env="${A6000_CONDA_ENV:-base}"
+
+if [ "$#" -eq 0 ]; then
+  cat <<'USAGE'
+Usage:
+  scripts/a6000-run <command> [args...]
+
+Examples:
+  scripts/a6000-run python -V
+  scripts/a6000-run python -m pytest tests
+  scripts/a6000-run bash -lc 'python -V && nvidia-smi'
+
+Environment overrides:
+  A6000_HOST       SSH host alias, default: A6000
+  A6000_REPO       Remote project path, default: /data/disk_7t/tongfan/GNT
+  A6000_CONDA_ENV  Conda environment, default: base
+  A6000_CONDA_SH   Conda hook path, default: /data/disk_7t/tongfan/miniconda3/etc/profile.d/conda.sh
+USAGE
+  exit 2
+fi
+
+printf -v command_line "%q " "$@"
+prefix="source $(printf "%q" "$conda_sh") && conda activate $(printf "%q" "$conda_env") && export LD_LIBRARY_PATH=\"\${CONDA_PREFIX}/lib:\${LD_LIBRARY_PATH:-}\" && cd $(printf "%q" "$repo") && "
+
+ssh -o BatchMode=yes "$host" "bash -lc $(printf "%q" "${prefix}${command_line}")"

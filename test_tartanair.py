@@ -9,6 +9,11 @@ import math
 from pathlib import Path
 from typing import Sized
 
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
 import cv2
 import numpy as np
 from collections import OrderedDict
@@ -18,20 +23,20 @@ import torch.backends.cudnn as cudnn
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
 # network
-from GeoNT.models.GeoNT.model import GeoNTWrapper
-from GeoNT.data_readers import get_data_loader
-from GeoNT.data_readers.factory import dataset_factory
-from GeoNT.losses import MultitaskLoss
+from geont.models import GeoNTWrapper
+from geont.data import get_data_loader
+from geont.data.factory import dataset_factory
+from geont.losses import MultitaskLoss
 
-from GeoNT.geom.graph_utils import build_frame_graph
+from geont.geometry.graph_utils import build_frame_graph
 
-import GeoNT.utils.misc as misc
-from GeoNT.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
+import geont.utils.misc as misc
+from geont.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 from alignment import align
-from GeoNT.geom.losses import pose_metrics
-from GeoNT.geom.graph_utils import graph_to_edge_list
-from GeoNT.geom.projective_ops import projective_transform, projective_transform_v2
+from geont.geometry.losses import pose_metrics
+from geont.geometry.graph_utils import graph_to_edge_list
+from geont.geometry.projective_ops import projective_transform, projective_transform_v2
 from lietorch import SE3, Sim3
 import matplotlib
 

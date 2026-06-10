@@ -3,7 +3,13 @@
 # Licensed under the BSD 3-Clause License
 
 import sys
-sys.path.append('GeoNT/models/flow')
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+sys.path.append(str(SRC / "geont" / "models" / "flow"))
 
 import argparse
 import numpy as np
@@ -19,8 +25,8 @@ from core.datasets import fetch_dataloader
 from core.utils.utils import load_ckpt
 from core.loss import sequence_loss, init_loss
 import os
-import GeoNT.utils.misc as misc
-from GeoNT.models.external import load_moge
+import geont.utils.misc as misc
+from geont.models.external import load_moge
 
 os.system("export KMP_INIT_AT_FORK=FALSE")
 

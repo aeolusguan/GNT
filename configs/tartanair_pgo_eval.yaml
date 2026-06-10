@@ -1,0 +1,28 @@
+tartanair_root: datasets/TartanAir
+split: src/geont/data/tartan_test.txt
+ckpt: output/checkpoint-latest.pth
+output: outputs/tartanair_pgo_eval
+
+scenes: []
+max_scenes: 0
+frame_start: 0
+frame_end: 80
+frame_skip: 1
+intrinsics: [320.0, 320.0, 320.0, 240.0]
+
+slam:
+  buffer: 1024
+  filter_thresh: 2.5
+  warmup: 8
+  frontend_radius: 2
+  frontend_thresh: 16.0
+  max_factors: 256
+  pgo_iters: 12
+  pgo_damping: 1.0e-3
+  pgo_lm_max_attempts: 5
+  pgo_huber_delta: 0.05
+  pgo_scale_conf: 0.01
+  pgo_mode: se3_scale
+  pgo_rotation_only: false
+  pgo_backend: cuda_eigen
+  use_fp16: true
