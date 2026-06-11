@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 
+#include <Eigen/Cholesky>
 #include <Eigen/Sparse>
 
 #include <algorithm>
@@ -41,7 +42,49 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> se3_scale
     torch::Tensor robust,
     double scale_prior_diag);
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, double>
+se3_scale_weighted_blocks_cuda(
+    torch::Tensor poses,
+    torch::Tensor log_s,
+    torch::Tensor rel_poses,
+    torch::Tensor prior_log_s,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    torch::Tensor sqrt_info,
+    double huber_delta,
+    double scale_prior_diag);
+
+std::tuple<torch::Tensor, torch::Tensor, double, double> se3_scale_candidate_cuda(
+    torch::Tensor poses,
+    torch::Tensor log_s,
+    torch::Tensor step_full,
+    torch::Tensor rel_poses,
+    torch::Tensor prior_log_s,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    torch::Tensor sqrt_info,
+    torch::Tensor robust,
+    int64_t anchor,
+    double scale_prior_diag);
+
+std::tuple<double, double, double, double, double, bool> se3_scale_stats_cuda(
+    torch::Tensor poses,
+    torch::Tensor log_s,
+    torch::Tensor rel_poses,
+    torch::Tensor prior_log_s,
+    torch::Tensor ii,
+    torch::Tensor jj,
+    torch::Tensor sqrt_info,
+    double scale_prior_diag);
+
 namespace {
+
+constexpr double LM_DAMPING_DECREASE = 0.5;
+constexpr double LM_DAMPING_INCREASE = 10.0;
+constexpr double LM_DAMPING_MIN = 1.0e-7;
+constexpr double LM_DAMPING_MAX = 1.0e7;
+constexpr int DENSE_EIGEN_VAR_LIMIT = 256;
+constexpr int DENSE_EIGEN_EDGE_THRESHOLD = 256;
 
 #define CHECK_FLOAT_OR_DOUBLE(x) \
     TORCH_CHECK(x.scalar_type() == at::kFloat || x.scalar_type() == at::kDouble, #x " must be float32 or float64")
@@ -90,7 +133,12 @@ public:
             ii_[e] = i;
             jj_[e] = j;
         }
-        build_pattern();
+        use_dense_ = n_vars_ <= DENSE_EIGEN_VAR_LIMIT && n_edges_ >= DENSE_EIGEN_EDGE_THRESHOLD;
+        if (use_dense_) {
+            init_dense_solver();
+        } else {
+            build_pattern();
+        }
     }
 
     torch::Tensor solve(
@@ -113,6 +161,38 @@ public:
         torch::Tensor prior_cpu;
         if constexpr (BLOCK_D == 7 || BLOCK_D == 4) {
             prior_cpu = prior_gradient.to(cpu_double).contiguous();
+        }
+        return solve_cpu_blocks(
+            source_cpu,
+            target_cpu,
+            residual_cpu,
+            prior_cpu,
+            damping,
+            scale_prior_diag,
+            source_block.options());
+    }
+
+    torch::Tensor solve_cpu_blocks(
+        const torch::Tensor& source_cpu,
+        const torch::Tensor& target_cpu,
+        const torch::Tensor& residual_cpu,
+        const torch::Tensor& prior_cpu,
+        double damping,
+        double scale_prior_diag,
+        const torch::TensorOptions& output_options) {
+        assemble_cpu_blocks(source_cpu, target_cpu, residual_cpu, prior_cpu, scale_prior_diag);
+        return solve_assembled(damping, output_options);
+    }
+
+    void assemble_cpu_blocks(
+        const torch::Tensor& source_cpu,
+        const torch::Tensor& target_cpu,
+        const torch::Tensor& residual_cpu,
+        const torch::Tensor& prior_cpu,
+        double scale_prior_diag) {
+        if (use_dense_) {
+            assemble_dense_cpu_blocks(source_cpu, target_cpu, residual_cpu, prior_cpu, scale_prior_diag);
+            return;
         }
 
         std::fill(A_.valuePtr(), A_.valuePtr() + A_.nonZeros(), 0.0);
@@ -152,15 +232,31 @@ public:
 
         for (int node = 0; node < n_nodes_; ++node) {
             for (int col = 0; col < BLOCK_D; ++col) {
-                double diag = damping;
                 if (fixed_dim_cpu<BLOCK_D, POSE_D>(node, col, anchor_)) {
-                    diag = 1.0;
+                    values[diag_value_indices_[node * BLOCK_D + col]] += 1.0;
                 } else if constexpr (BLOCK_D == 7 || BLOCK_D == 4) {
                     if (col == BLOCK_D - 1) {
-                        diag += scale_prior_diag;
+                        values[diag_value_indices_[node * BLOCK_D + col]] += scale_prior_diag;
                     }
                 }
-                values[diag_value_indices_[node * BLOCK_D + col]] += diag;
+            }
+        }
+
+        base_values_.assign(A_.valuePtr(), A_.valuePtr() + A_.nonZeros());
+    }
+
+    torch::Tensor solve_assembled(double damping, const torch::TensorOptions& output_options) {
+        if (use_dense_) {
+            return solve_dense_assembled(damping, output_options);
+        }
+
+        std::copy(base_values_.begin(), base_values_.end(), A_.valuePtr());
+        double* values = A_.valuePtr();
+        for (int node = 0; node < n_nodes_; ++node) {
+            for (int col = 0; col < BLOCK_D; ++col) {
+                if (!fixed_dim_cpu<BLOCK_D, POSE_D>(node, col, anchor_)) {
+                    values[diag_value_indices_[node * BLOCK_D + col]] += damping;
+                }
             }
         }
 
@@ -172,9 +268,10 @@ public:
             TORCH_CHECK(std::isfinite(step[idx]), "Eigen SimplicialLLT returned a non-finite step");
         }
 
+        const auto cpu_double = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64);
         auto step_cpu = torch::empty({n_vars_}, cpu_double);
         std::memcpy(step_cpu.data_ptr<double>(), step.data(), static_cast<size_t>(n_vars_) * sizeof(double));
-        return step_cpu.to(source_block.options());
+        return step_cpu.to(output_options);
     }
 
 private:
@@ -385,6 +482,121 @@ private:
         }
     }
 
+    void init_dense_solver() {
+        dense_A_ = Eigen::MatrixXd::Zero(n_vars_, n_vars_);
+        base_dense_A_ = Eigen::MatrixXd::Zero(n_vars_, n_vars_);
+        grad_ = Eigen::VectorXd::Zero(n_vars_);
+    }
+
+    void add_dense_pair_contributions(
+        const double* block_a_ptr,
+        const double* block_b_ptr,
+        int node_a,
+        int node_b,
+        uint8_t block_a,
+        uint8_t block_b) {
+        for (int a = 0; a < BLOCK_D; ++a) {
+            if (fixed_dim_cpu<BLOCK_D, POSE_D>(node_a, a, anchor_)) {
+                continue;
+            }
+            const int row_index = node_a * BLOCK_D + a;
+            for (int b = 0; b < BLOCK_D; ++b) {
+                if (fixed_dim_cpu<BLOCK_D, POSE_D>(node_b, b, anchor_)) {
+                    continue;
+                }
+                const int col_index = node_b * BLOCK_D + b;
+                if (row_index < col_index) {
+                    continue;
+                }
+                const uint8_t residual_mask =
+                    residual_support_mask(block_a, a) & residual_support_mask(block_b, b);
+                if (residual_mask == 0) {
+                    continue;
+                }
+                dense_A_(row_index, col_index) += dot_block_columns(
+                    block_a_ptr,
+                    block_b_ptr,
+                    a,
+                    b,
+                    residual_mask);
+            }
+        }
+    }
+
+    void assemble_dense_cpu_blocks(
+        const torch::Tensor& source_cpu,
+        const torch::Tensor& target_cpu,
+        const torch::Tensor& residual_cpu,
+        const torch::Tensor& prior_cpu,
+        double scale_prior_diag) {
+        dense_A_.setZero();
+        grad_.setZero();
+
+        const double* source_ptr = source_cpu.data_ptr<double>();
+        const double* target_ptr = target_cpu.data_ptr<double>();
+        const double* residual_ptr = residual_cpu.data_ptr<double>();
+
+        for (int e = 0; e < n_edges_; ++e) {
+            const double* src = source_ptr + e * RES_D * BLOCK_D;
+            const double* tgt = target_ptr + e * RES_D * BLOCK_D;
+            const double* res = residual_ptr + e * RES_D;
+            const int i = ii_[e];
+            const int j = jj_[e];
+            add_gradient(src, res, i, 0);
+            add_gradient(tgt, res, j, 1);
+            add_dense_pair_contributions(src, src, i, i, 0, 0);
+            add_dense_pair_contributions(src, tgt, i, j, 0, 1);
+            add_dense_pair_contributions(tgt, src, j, i, 1, 0);
+            add_dense_pair_contributions(tgt, tgt, j, j, 1, 1);
+        }
+
+        if constexpr (BLOCK_D == 7 || BLOCK_D == 4) {
+            const double* prior_ptr = prior_cpu.data_ptr<double>();
+            for (int node = 0; node < n_nodes_; ++node) {
+                grad_[node * BLOCK_D + (BLOCK_D - 1)] += prior_ptr[node];
+            }
+        }
+
+        for (int node = 0; node < n_nodes_; ++node) {
+            for (int col = 0; col < BLOCK_D; ++col) {
+                const int idx = node * BLOCK_D + col;
+                if (fixed_dim_cpu<BLOCK_D, POSE_D>(node, col, anchor_)) {
+                    dense_A_(idx, idx) += 1.0;
+                } else if constexpr (BLOCK_D == 7 || BLOCK_D == 4) {
+                    if (col == BLOCK_D - 1) {
+                        dense_A_(idx, idx) += scale_prior_diag;
+                    }
+                }
+            }
+        }
+
+        base_dense_A_ = dense_A_;
+    }
+
+    torch::Tensor solve_dense_assembled(double damping, const torch::TensorOptions& output_options) {
+        dense_A_ = base_dense_A_;
+        for (int node = 0; node < n_nodes_; ++node) {
+            for (int col = 0; col < BLOCK_D; ++col) {
+                if (!fixed_dim_cpu<BLOCK_D, POSE_D>(node, col, anchor_)) {
+                    dense_A_(node * BLOCK_D + col, node * BLOCK_D + col) += damping;
+                }
+            }
+        }
+
+        dense_solver_.compute(dense_A_);
+        TORCH_CHECK(dense_solver_.info() == Eigen::Success, "Eigen dense LLT factorization failed");
+        Eigen::VectorXd step = dense_solver_.solve(-grad_);
+        TORCH_CHECK(dense_solver_.info() == Eigen::Success, "Eigen dense LLT solve failed");
+        for (int idx = 0; idx < step.size(); ++idx) {
+            TORCH_CHECK(std::isfinite(step[idx]), "Eigen dense LLT returned a non-finite step");
+        }
+
+        const auto cpu_double = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64);
+        auto step_cpu = torch::empty({n_vars_}, cpu_double);
+        std::memcpy(step_cpu.data_ptr<double>(), step.data(), static_cast<size_t>(n_vars_) * sizeof(double));
+        return step_cpu.to(output_options);
+    }
+
     void build_pattern() {
         std::vector<Eigen::Triplet<double>> triplets;
         triplets.reserve(static_cast<size_t>(n_edges_) * BLOCK_D * BLOCK_D * 2 + static_cast<size_t>(n_vars_));
@@ -439,12 +651,17 @@ private:
     int anchor_;
     int n_edges_;
     int n_vars_;
+    bool use_dense_ = false;
     std::vector<int> ii_;
     std::vector<int> jj_;
     std::vector<int> diag_value_indices_;
     std::vector<HessianContribution> hessian_contributions_;
+    std::vector<double> base_values_;
+    Eigen::MatrixXd dense_A_;
+    Eigen::MatrixXd base_dense_A_;
     SparseMatrix A_;
     Eigen::VectorXd grad_;
+    Eigen::LLT<Eigen::MatrixXd, Eigen::Lower> dense_solver_;
     Eigen::SimplicialLLT<SparseMatrix, Eigen::Lower> solver_;
 };
 
@@ -494,7 +711,11 @@ private:
 class Se3ScaleEigenSimplicialLLTSolver {
 public:
     Se3ScaleEigenSimplicialLLTSolver(torch::Tensor ii, torch::Tensor jj, int64_t n_nodes, int64_t anchor)
-        : solver_(ii, jj, n_nodes, anchor) {}
+        : solver_(ii, jj, n_nodes, anchor),
+          ii_(ii.contiguous()),
+          jj_(jj.contiguous()),
+          n_nodes_(static_cast<int>(n_nodes)),
+          anchor_(static_cast<int>(anchor)) {}
 
     torch::Tensor solve(
         torch::Tensor source_block,
@@ -512,8 +733,80 @@ public:
             scale_prior_diag);
     }
 
+    std::tuple<torch::Tensor, torch::Tensor, double, double, double, bool, int64_t, int64_t> solve_lm_attempts(
+        torch::Tensor source_block,
+        torch::Tensor target_block,
+        torch::Tensor edge_residual,
+        torch::Tensor prior_gradient,
+        torch::Tensor poses,
+        torch::Tensor log_s,
+        torch::Tensor rel_poses,
+        torch::Tensor prior_log_s,
+        torch::Tensor sqrt_info,
+        torch::Tensor robust,
+        double current_cost,
+        double lm,
+        int64_t lm_max_attempts,
+        double scale_prior_diag) {
+        const auto cpu_double = torch::TensorOptions().device(torch::kCPU).dtype(torch::kFloat64);
+        auto source_cpu = source_block.to(cpu_double).contiguous();
+        auto target_cpu = target_block.to(cpu_double).contiguous();
+        auto residual_cpu = edge_residual.to(cpu_double).contiguous();
+        auto prior_cpu = prior_gradient.to(cpu_double).contiguous();
+
+        torch::Tensor candidate_poses = poses;
+        torch::Tensor candidate_log_s = log_s;
+        double candidate_cost = current_cost;
+        double step_norm = 0.0;
+        bool improved = false;
+        int64_t rejected = 0;
+        int64_t solver_failures = 0;
+        solver_.assemble_cpu_blocks(source_cpu, target_cpu, residual_cpu, prior_cpu, scale_prior_diag);
+
+        for (int64_t attempt = 0; attempt < lm_max_attempts; ++attempt) {
+            torch::Tensor step_full;
+            try {
+                step_full = solver_.solve_assembled(lm, source_block.options()).view({n_nodes_, 7});
+            } catch (const c10::Error&) {
+                ++solver_failures;
+                lm = std::min(lm * LM_DAMPING_INCREASE, LM_DAMPING_MAX);
+                continue;
+            }
+
+            auto candidate = se3_scale_candidate_cuda(
+                poses,
+                log_s,
+                step_full,
+                rel_poses,
+                prior_log_s,
+                ii_,
+                jj_,
+                sqrt_info,
+                robust,
+                anchor_,
+                scale_prior_diag);
+            candidate_poses = std::get<0>(candidate);
+            candidate_log_s = std::get<1>(candidate);
+            candidate_cost = std::get<2>(candidate);
+            step_norm = std::get<3>(candidate);
+            if (candidate_cost <= current_cost) {
+                lm = std::max(lm * LM_DAMPING_DECREASE, LM_DAMPING_MIN);
+                improved = true;
+                break;
+            }
+            ++rejected;
+            lm = std::min(lm * LM_DAMPING_INCREASE, LM_DAMPING_MAX);
+        }
+
+        return {candidate_poses, candidate_log_s, candidate_cost, step_norm, lm, improved, rejected, solver_failures};
+    }
+
 private:
     CachedEigenSimplicialLLT<6, 7, 6> solver_;
+    torch::Tensor ii_;
+    torch::Tensor jj_;
+    int n_nodes_;
+    int anchor_;
 };
 
 }  // namespace
@@ -522,6 +815,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rotation_blocks", &rotation_blocks_cuda, "rotation PGO CUDA block assembly");
     m.def("translation_scale_blocks", &translation_scale_blocks_cuda, "translation+scale PGO CUDA block assembly");
     m.def("se3_scale_blocks", &se3_scale_blocks_cuda, "SE3+scale PGO CUDA block assembly");
+    m.def("se3_scale_weighted_blocks", &se3_scale_weighted_blocks_cuda, "SE3+scale PGO CUDA weighted block assembly");
+    m.def("se3_scale_candidate", &se3_scale_candidate_cuda, "SE3+scale PGO CUDA candidate evaluation");
+    m.def("se3_scale_stats", &se3_scale_stats_cuda, "SE3+scale PGO CUDA final statistics");
     pybind11::class_<RotationEigenSimplicialLLTSolver>(m, "RotationEigenSimplicialLLTSolver")
         .def(pybind11::init<torch::Tensor, torch::Tensor, int64_t, int64_t>())
         .def("solve", &RotationEigenSimplicialLLTSolver::solve);
@@ -530,5 +826,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("solve", &TranslationScaleEigenSimplicialLLTSolver::solve);
     pybind11::class_<Se3ScaleEigenSimplicialLLTSolver>(m, "Se3ScaleEigenSimplicialLLTSolver")
         .def(pybind11::init<torch::Tensor, torch::Tensor, int64_t, int64_t>())
-        .def("solve", &Se3ScaleEigenSimplicialLLTSolver::solve);
+        .def("solve", &Se3ScaleEigenSimplicialLLTSolver::solve)
+        .def("solve_lm_attempts", &Se3ScaleEigenSimplicialLLTSolver::solve_lm_attempts);
 }

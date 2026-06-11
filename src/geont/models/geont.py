@@ -150,6 +150,7 @@ class GeoNT(nn.Module):
         intrinsics: torch.Tensor,
         export_feat_layers: list[int] | None = None,
         use_fp16: bool = False,
+        decode_depth: bool = True,
     ):
         """Run GeoNT from precomputed per-edge motion tokens.
 
@@ -171,19 +172,22 @@ class GeoNT(nn.Module):
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
             feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
 
-        res_feat = self.res_depth_embed(depthmap)
         ht, wd = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))
             pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])
 
-        return {
-            "depth": depth.squeeze(0),
-            "depth_conf": depth_conf.squeeze(0),
+        output = {
             "pose_enc": pose_enc.squeeze(0),
             "pose_confidence": pose_log_variance.squeeze(0),
             "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
         }
+        if decode_depth:
+            res_feat = self.res_depth_embed(depthmap)
+            with torch.autocast(device_type=patch_token.device.type, enabled=False):
+                depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))
+            output["depth"] = depth.squeeze(0)
+            output["depth_conf"] = depth_conf.squeeze(0)
+        return output
 
     def _extract_auxiliary_features(
         self, feats: list[torch.Tensor], feat_layers: list[int], H: int, W: int
@@ -457,6 +461,7 @@ class GeoNTWrapper(nn.Module):
         mask: torch.Tensor,
         intrinsics: torch.Tensor,
         use_fp16: bool = False,
+        decode_depth: bool = True,
     ):
         return self.gnt.forward_from_motion_tokens(
             motion_token,
@@ -464,4 +469,5 @@ class GeoNTWrapper(nn.Module):
             intrinsics,
             export_feat_layers=[],
             use_fp16=use_fp16,
+            decode_depth=decode_depth,
         )

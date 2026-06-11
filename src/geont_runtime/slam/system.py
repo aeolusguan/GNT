@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import uuid
+from pathlib import Path
 
 import numpy as np
 import rerun as rr
@@ -30,6 +31,7 @@ from .components.buffer import GraphBuffer
 from .components.frontend import SLAMFrontend
 from .components.initializer import OnePassInitializer
 from .components.motion_filter import MotionFilter
+from .frontend_snapshot import save_initializer_snapshot
 from .interface import SLAMOutput
 
 
@@ -194,7 +196,7 @@ class SLAMSystem:
 
         frame_data: VideoFrame
         for frame_idx, frame_data in pbar(
-            enumerate(video_stream), desc="SLAM Pass (1/2)", total=total_n_frames
+            enumerate(video_stream), desc="SLAM Initialization", total=total_n_frames
         ):
             images, intrinsics = self._precompute_features(frame_data)
 
@@ -219,11 +221,24 @@ class SLAMSystem:
                 self.initializer.run()
 
         self.initializer.finalize()
-        # Second pass is temporarily disabled while one-pass initialization PGO is under debug.
-        # self.frontend.run_second_pass()
+        initializer_snapshot_path = str(self.config.initializer_snapshot_path)
+        if initializer_snapshot_path:
+            save_initializer_snapshot(
+                Path(initializer_snapshot_path),
+                self.buffer,
+                self.initializer.edges,
+                metadata={
+                    "ckpt_path": str(self.config.ckpt_path),
+                    "pgo_mode": str(self.config.pgo_mode),
+                    "pgo_backend": str(self.config.pgo_backend),
+                },
+            )
+        edges = self.initializer.edges
+        if self.config.enable_frontend:
+            self.frontend.run(self.initializer.edges)
+            edges = self.frontend.graph.edges
 
         original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics[0])
-        edges = self.initializer.edges
         return SLAMOutput(
             trajectory=SE3(self.buffer.poses[: self.buffer.n_frames]),
             intrinsics=original_intrinsics,

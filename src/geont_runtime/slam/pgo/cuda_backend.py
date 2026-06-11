@@ -139,8 +139,88 @@ def build_se3_scale_blocks(
     )
 
 
+def build_se3_scale_weighted_blocks(
+    poses: torch.Tensor,
+    log_s: torch.Tensor,
+    rel_poses: torch.Tensor,
+    prior_log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    huber_delta: float,
+    scale_prior_diag: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+    """Build Huber-weighted SE3+scale blocks and return current/unrobust costs."""
+    ext = _extension()
+    return ext.se3_scale_weighted_blocks(
+        _check_cuda_float32("poses", poses),
+        _check_cuda_float32("log_s", log_s),
+        _check_cuda_float32("rel_poses", rel_poses),
+        _check_cuda_float32("prior_log_s", prior_log_s),
+        _check_cuda_int64("ii", ii),
+        _check_cuda_int64("jj", jj),
+        _check_cuda_float32("sqrt_info", sqrt_info),
+        float(huber_delta),
+        float(scale_prior_diag),
+    )
+
+
+def evaluate_se3_scale_candidate(
+    poses: torch.Tensor,
+    log_s: torch.Tensor,
+    step_full: torch.Tensor,
+    rel_poses: torch.Tensor,
+    prior_log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    robust: torch.Tensor,
+    anchor: int,
+    scale_prior_diag: float,
+) -> tuple[torch.Tensor, torch.Tensor, float, float]:
+    """Apply one SE3+scale LM candidate step and return its weighted cost."""
+    ext = _extension()
+    return ext.se3_scale_candidate(
+        _check_cuda_float32("poses", poses),
+        _check_cuda_float32("log_s", log_s),
+        _check_cuda_float32("step_full", step_full),
+        _check_cuda_float32("rel_poses", rel_poses),
+        _check_cuda_float32("prior_log_s", prior_log_s),
+        _check_cuda_int64("ii", ii),
+        _check_cuda_int64("jj", jj),
+        _check_cuda_float32("sqrt_info", sqrt_info),
+        _check_cuda_float32("robust", robust),
+        int(anchor),
+        float(scale_prior_diag),
+    )
+
+
+def evaluate_se3_scale_stats(
+    poses: torch.Tensor,
+    log_s: torch.Tensor,
+    rel_poses: torch.Tensor,
+    prior_log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    scale_prior_diag: float,
+) -> tuple[float, float, float, float, float, bool]:
+    """Return final SE3+scale weighted cost and residual summary statistics."""
+    ext = _extension()
+    return ext.se3_scale_stats(
+        _check_cuda_float32("poses", poses),
+        _check_cuda_float32("log_s", log_s),
+        _check_cuda_float32("rel_poses", rel_poses),
+        _check_cuda_float32("prior_log_s", prior_log_s),
+        _check_cuda_int64("ii", ii),
+        _check_cuda_int64("jj", jj),
+        _check_cuda_float32("sqrt_info", sqrt_info),
+        float(scale_prior_diag),
+    )
+
+
 class RotationEigenSimplicialLLTSolver:
-    """Cached CPU Eigen SimplicialLLT solver for one fixed rotation graph."""
+    """Cached CPU Eigen LLT solver for one fixed rotation graph."""
 
     def __init__(self, ii: torch.Tensor, jj: torch.Tensor, n_nodes: int, anchor: int):
         ext = _extension()
@@ -169,7 +249,7 @@ class RotationEigenSimplicialLLTSolver:
 
 
 class TranslationScaleEigenSimplicialLLTSolver:
-    """Cached CPU Eigen SimplicialLLT solver for one fixed translation+scale graph."""
+    """Cached CPU Eigen LLT solver for one fixed translation+scale graph."""
 
     def __init__(self, ii: torch.Tensor, jj: torch.Tensor, n_nodes: int, anchor: int):
         ext = _extension()
@@ -202,7 +282,7 @@ class TranslationScaleEigenSimplicialLLTSolver:
 
 
 class Se3ScaleEigenSimplicialLLTSolver:
-    """Cached CPU Eigen SimplicialLLT solver for one fixed SE3+scale graph."""
+    """Cached CPU Eigen LLT solver for one fixed SE3+scale graph."""
 
     def __init__(self, ii: torch.Tensor, jj: torch.Tensor, n_nodes: int, anchor: int):
         ext = _extension()
@@ -232,3 +312,37 @@ class Se3ScaleEigenSimplicialLLTSolver:
             float(scale_prior_diag),
         )
         return step.view(self.n_nodes, 7)
+
+    def solve_lm_attempts(
+        self,
+        source_block: torch.Tensor,
+        target_block: torch.Tensor,
+        edge_residual: torch.Tensor,
+        prior_gradient: torch.Tensor,
+        poses: torch.Tensor,
+        log_s: torch.Tensor,
+        rel_poses: torch.Tensor,
+        prior_log_s: torch.Tensor,
+        sqrt_info: torch.Tensor,
+        robust: torch.Tensor,
+        current_cost: float,
+        lm: float,
+        lm_max_attempts: int,
+        scale_prior_diag: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, bool, int, int]:
+        return self._solver.solve_lm_attempts(
+            _check_cuda_float32("source_block", source_block),
+            _check_cuda_float32("target_block", target_block),
+            _check_cuda_float32("edge_residual", edge_residual),
+            _check_cuda_float32("prior_gradient", prior_gradient),
+            _check_cuda_float32("poses", poses),
+            _check_cuda_float32("log_s", log_s),
+            _check_cuda_float32("rel_poses", rel_poses),
+            _check_cuda_float32("prior_log_s", prior_log_s),
+            _check_cuda_float32("sqrt_info", sqrt_info),
+            _check_cuda_float32("robust", robust),
+            float(current_cost),
+            float(lm),
+            int(lm_max_attempts),
+            float(scale_prior_diag),
+        )

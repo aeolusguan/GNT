@@ -8,8 +8,8 @@ strategy:
    temporal neighborhood edges inside the most recent `warmup` keyframe window. It keeps
    an edge when the mean flow magnitude is at most `frontend_thresh`.
 3. The one-pass initializer uses `InitializationFactorGraph`, whose active graph
-   state is only directed `ii`/`jj` edges. Edge ages, motion-token caching, and
-   `max_factors` belong to the derived refinement `FactorGraph`.
+   state is only directed `ii`/`jj` edges. Motion-token caching, finalized edge
+   storage, and `max_factors` belong to the derived refinement `FactorGraph`.
 4. `OnePassInitializer.finalize()` marginalizes all active source keyframes.
    Marginalization runs GeoNT with each finalized keyframe as common reference,
    saves the relative pose/depth constraints in `OnePassInitializer.edges`, and
@@ -17,11 +17,12 @@ strategy:
 5. Finalized relative constraints are optimized by the configured pose graph
    optimizer on the same device as the SLAM buffers, producing initialized
    keyframe depth scales and poses.
-6. The second pass builds a `FactorGraph` over the initialized keyframes. It
-   scores candidate directed pairs by coarse reprojection flow from the
-   initialized pose/depth state, keeps projection-proximity factors below
-   `frontend_thresh`, runs GeoNT refinement on those factors, and optimizes the
-   resulting pose graph.
+6. When `enable_frontend` is true, the offline frontend builds a `FactorGraph`
+   over the initialized keyframes. It sweeps DROID-style recent source bands
+   through a local proximity window, scores older candidate pairs by coarse
+   reprojection flow from the initialized pose/depth state, then flushes all
+   active source buckets into finalized frontend edges and runs one
+   sequence-global PGO.
 
 Install the checkout in editable mode once so package modules and console
 entrypoints resolve from the `src/` layout:
@@ -73,6 +74,13 @@ warmup: 8
 frontend_radius: 2
 frontend_thresh: 16.0
 max_factors: 256
+enable_frontend: false
+initializer_snapshot_path: ""
+proximity_window: 25
+proximity_recent: 5
+proximity_nms: 1
+proximity_thresh: 16.0
+frontend_min_edges_per_source: 5
 seq_init: false
 pgo_iters: 12
 pgo_damping: 1.0e-3
@@ -82,6 +90,7 @@ pgo_scale_conf: 0.01
 pgo_mode: se3_scale
 pgo_rotation_only: false
 pgo_backend: cuda_eigen
+frontend_outlier_trans_conf_thresh: 0.1
 use_fp16: true
 ```
 
@@ -91,8 +100,41 @@ processor applies it before resize/crop so the model receives transformed
 intrinsics, while saved artifacts recover the original configured intrinsics.
 `pgo_scale_conf` is the soft per-node pose-scale prior strength used by the
 active SE3+scale PGO path.
-`max_factors` caps the second-pass projection-proximity factors selected from
-the initialized keyframe graph before GeoNT refinement.
+`frontend_outlier_trans_conf_thresh` is the frontend-only, confidence-only outlier gate for
+offline proximity/refinement edges as they are finalized. A new frontend edge
+is accepted before `PoseGraphEdges.add()` only when its translation confidence
+`confidence[:, 0]` is at least this threshold. The one-pass initializer does
+not apply this filter; it provides the connected baseline graph that the
+offline frontend inherits.
+`enable_frontend` is false by default while the one-pass initialization PGO
+path is being debugged. When enabled, the offline frontend runs once after the
+one-pass initializer. Set `initializer_snapshot_path` to save a frontend replay
+snapshot immediately after `OnePassInitializer.finalize()` and before
+`SLAMFrontend.run()`. `proximity_recent` mirrors the
+DROID-style recent source band width, `proximity_window` is the local target
+search window, `proximity_nms` suppresses nearby duplicate proximity
+candidates, and `proximity_thresh` is the projection-flow acceptance threshold.
+The default frontend sweep only adds proximity factors; it does not run
+local-window PGO, GeoNT refinement, source marginalization, budget flush, or
+deadline flush during the sweep. After the sweep, the frontend marginalizes all
+active source buckets in one pass, then runs one sequence-global PGO. That final
+solve initializes from the current buffer pose/scale state left by the one-pass
+initializer and reports `scope: frontend_full_graph`.
+`FactorGraph.optimize_finalized_pose_graph_window()` remains available as an
+experiment/debug helper, but it is not part of the default frontend run.
+`max_factors`, `frontend_min_edges_per_source`, and frontend-window deadline
+helpers are retained for future online frontend development, but they are not
+part of the current default offline sweep scheduling.
+GeoNT refinement always receives the original normalized MoGe depth prior
+stored in `depths_sens_normed`, matching training. One-pass initializer
+marginalization decodes GeoNT depth and is the only path that commits refined
+depth and source-scale updates from the depth decoder. Offline frontend
+marginalization runs GeoNT pose-only from motion tokens after the sweep
+(`decode_depth=False`): it does not run the depth decoder and does not write
+stored refined depth or `depths_sens_scale` from a refined-depth mean
+correction. Projection-distance scoring therefore uses the coherent initialized
+depth/scale state throughout the sweep. This keeps source-normalized frontend
+edge translations aligned with the PGO residual convention.
 `pgo_lm_max_attempts` is the maximum number of Levenberg-Marquardt damping
 attempts per linearized update before the solve stops.
 `pgo_mode: se3_scale` runs the joint SE3+scale optimizer and is the default
@@ -100,18 +142,21 @@ path for the current network predictions. Use `pgo_mode: staged` for the
 rotation-first, fixed-rotation translation+scale ablation. `pgo_backend:
 cuda_eigen` is the production PGO backend: it
 builds fixed-layout CUDA Jacobian blocks, copies them to CPU double precision,
-assembles a sparse Eigen normal matrix, and solves it with `SimplicialLLT`.
+assembles Eigen normal systems, and solves them with CPU Eigen LLT. Sparse
+`SimplicialLLT` remains the default; small high-edge-count local-window systems
+use dense Eigen LLT to avoid sparse symbolic setup overhead.
 `torch` remains available as the dense reference path for CPU/unit tests.
 `normal_equation_assembly` and `linear_solver_impl` in `pgo_info` distinguish
-the concrete path. The CUDA extension uses vendored Eigen headers from
+the concrete path, and `linear_solver_variant` records `simplicial_llt` or
+`dense_llt`. The CUDA extension uses vendored Eigen headers from
 `third_party/eigen/upstream`; set `GNT_EIGEN_INCLUDE_DIR` only to override
 that project-local dependency.
 
 DROID-SLAM's native inference BA is a useful accuracy reference but not the
 same solve path: it builds BA/Schur blocks with CUDA kernels, transfers sparse
-blocks to CPU double precision, solves with Eigen `SimplicialLLT`, then copies
-the increment back to CUDA for SE3/disparity retraction. The `cuda_eigen` PGO
-backend follows that CPU sparse-solve pattern for the PGO normal equations.
+blocks to CPU double precision, solves with Eigen, then copies the increment
+back to CUDA for SE3/disparity retraction. The `cuda_eigen` PGO backend follows
+that CPU Eigen solve pattern for the PGO normal equations.
 
 The pose artifact is written to:
 
@@ -143,7 +188,9 @@ The `.npz` contains:
   a separate scalar side channel, not as a raw Sim3 group scale.
 - `pgo_info`: JSON-encoded diagnostics from the last PGO pass, including
   initial/final cost, accepted iteration count, rejected LM attempts, and solver
-  failure count.
+  failure count. When the offline frontend is enabled, this describes the final
+  sequence-global frontend PGO solve, reports `scope: frontend_full_graph`,
+  and includes aggregate frontend outlier-gate counts.
 
 The depth `.npz` contains:
 
@@ -158,7 +205,7 @@ The finalized edge convention is source-depth-normalized:
 ```text
 edge_relative_pose_ij[:3] ~= translation(T_j * inv(T_i)) / scale_i
 edge_relative_pose_ij[3:7] ~= rotation(T_j * inv(T_i))
-edge_relative_scale_ij ~= scale_i * mean(depth_moge_i) / mean(depth_refined_i)
+edge_relative_scale_ij ~= source/reference depth-scale diagnostic
 ```
 
 The active PGO path first optimizes rotations from the initialized pose tree,
@@ -181,15 +228,50 @@ all node scales, including the first keyframe scale, remain optimized under
 the soft scale prior. No per-edge translation scale correction is optimized in
 the active PGO path. With the current network predictions, joint `se3_scale`
 PGO is the default accuracy path; staged PGO remains available for ablation.
+One-pass initializer edge diagnostics may include the refined-depth mean scale
+correction. Frontend finalized edges preserve the coherent source keyframe
+scale at marginalization time because frontend pose-only refinement does not
+decode depth or recompute source scale.
 
 PGO implementation lives under `src/geont_runtime/slam/pgo/`:
 
 - `optimizer.py`: public optimizer entry point and staged/joint mode dispatch
 - `common.py`: shared residuals, initialization, Jacobian helpers, and result types
 - `torch_backend.py`: dense Torch reference implementation
-- `cuda_eigen.py`: CUDA block assembly plus CPU Eigen sparse Cholesky backend
+- `cuda_eigen.py`: CUDA block assembly plus CPU Eigen Cholesky backend
 - `cuda_backend.py` and `cuda/`: lazy-built native CUDA extension wrapper/source
 - `replay.py`: frozen PGO replay graph serialization helpers
+
+## Replay Offline Frontend
+
+PGO replay graphs are useful for optimizer debugging, but they are not enough
+to replay the offline frontend because the frontend needs GeoNT feature maps,
+bases, normalized MoGe depth priors, masks, poses, scales, and finalized
+initializer edges. Save that full handoff state by setting:
+
+```bash
+inference \
+  streams.base_path=/path/to/frames \
+  pipeline.slam.ckpt_path=/path/to/geont_checkpoint.pth \
+  pipeline.slam.intrinsics=[128,128,64,48] \
+  pipeline.slam.initializer_snapshot_path=outputs/frontend_snapshots/sequence.npz
+```
+
+Then replay only the offline frontend:
+
+```bash
+python scripts/replay_frontend.py \
+  snapshot=outputs/frontend_snapshots/sequence.npz \
+  ckpt_path=/path/to/geont_checkpoint.pth \
+  output=outputs/frontend_replay/sequence.npz
+```
+
+The replay still loads the GeoNT checkpoint because `SLAMFrontend` runs
+`patch_embed` and `refine_from_motion_tokens`, but it skips frame loading,
+motion filtering, feature extraction, one-pass initializer marginalization, and
+initializer PGO. The replay output stores the final keyframe trajectory,
+scales, finalized frontend edges, `pgo_info`, and the final full-graph PGO
+replay graph.
 
 ## Visualize One-Pass Factor Graph
 

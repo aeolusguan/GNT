@@ -19,9 +19,9 @@ TORCH_SOLVER_INFO = {
     "linear_solver_impl": "torch_cholesky_ex",
 }
 CUDA_EIGEN_SOLVER_INFO = {
-    "linear_solver": "sparse_cholesky",
+    "linear_solver": "eigen_cholesky",
     "normal_equation_assembly": "cuda_blocks",
-    "linear_solver_impl": "cuda_extension_cpu_eigen_simplicial_llt",
+    "linear_solver_impl": "cuda_extension_cpu_eigen_llt",
 }
 PGO_MODES = {"rotation_only", "staged", "se3_scale"}
 CUDA_EIGEN_BACKEND = "cuda_eigen"
@@ -161,20 +161,20 @@ def _so3_right_jacobian_inverse(phi: torch.Tensor) -> torch.Tensor:
 
 def _edge_sqrt_information(edge_conf: torch.Tensor):
     """edge_conf is (E, 2) = [translation_conf, rotation_conf]; returns (E, 6)."""
-    info = edge_conf[..., :2].clamp_min(1e-6)
+    info = edge_conf[..., :2].clamp_min(0.0)
     return torch.sqrt(torch.cat((info[:, :1].expand(-1, 3), info[:, 1:2].expand(-1, 3)), dim=-1))
 
 
 def _rotation_sqrt_information(edge_conf: torch.Tensor):
     """edge_conf is (E, 2); returns (E, 3) rotation sqrt information."""
     rot_info = edge_conf[..., 1]
-    return torch.sqrt(rot_info.clamp_min(1e-6))[:, None].expand(-1, 3)
+    return torch.sqrt(rot_info.clamp_min(0.0))[:, None].expand(-1, 3)
 
 
 def _translation_sqrt_information(edge_conf: torch.Tensor):
     """edge_conf is (E, 2); returns (E, 3) translation sqrt information."""
     trans_info = edge_conf[..., 0]
-    return torch.sqrt(trans_info.clamp_min(1e-6))[:, None].expand(-1, 3)
+    return torch.sqrt(trans_info.clamp_min(0.0))[:, None].expand(-1, 3)
 
 
 def _scale_prior_residuals(

@@ -216,11 +216,11 @@ def optimize_sim3_pose_graph(
     Relative edge scales are not used as hard scale measurements in the PGO
     objective. The default solve is joint SE3+scale PGO. Staged rotation then
     fixed-rotation translation+scale PGO remains available as an ablation.
-    backend="cuda_eigen" is the production CUDA
-    path: it builds fixed-layout CUDA Jacobian blocks, copies them to CPU
-    double precision, and solves the sparse normal system with cached Eigen
-    SimplicialLLT. backend="torch" is retained as the dense reference path for
-    CPU/unit tests.
+    backend="cuda_eigen" is the production CUDA path: it builds fixed-layout
+    CUDA Jacobian blocks, copies them to CPU double precision, and solves the
+    normal system with CPU Eigen LLT. Sparse SimplicialLLT is used by default;
+    small high-edge-count local windows use dense Eigen LLT. backend="torch"
+    is retained as the dense reference path for CPU/unit tests.
     """
     if n_nodes <= 0:
         raise ValueError("n_nodes must be positive")

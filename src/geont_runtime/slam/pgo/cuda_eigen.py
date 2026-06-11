@@ -13,17 +13,27 @@ from .common import (
     LM_DAMPING_MIN,
     RelativeEdges,
     Sim3PGOResult,
-    _apply_delta,
     _apply_rotation_delta,
     _apply_translation_scale_delta,
     _edge_sqrt_information,
     _rotation_residuals,
     _rotation_sqrt_information,
     _scale_prior_residuals,
-    _scaled_se3_residuals,
     _translation_residuals,
     _translation_sqrt_information,
 )
+
+
+_DENSE_EIGEN_VAR_LIMIT = 256
+_DENSE_EIGEN_EDGE_THRESHOLD = 256
+
+
+def _eigen_solver_variant(n_nodes: int, block_dim: int, n_edges: int) -> str:
+    use_dense = (
+        int(n_nodes) * int(block_dim) <= _DENSE_EIGEN_VAR_LIMIT
+        and int(n_edges) >= _DENSE_EIGEN_EDGE_THRESHOLD
+    )
+    return "dense_llt" if use_dense else "simplicial_llt"
 
 
 def _rotation_cuda_blocks(
@@ -115,6 +125,89 @@ def _se3_scale_cuda_blocks(
     )
 
 
+def _se3_scale_cuda_weighted_blocks(
+    poses: SE3,
+    log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    rel_edges: RelativeEdges,
+    prior_log_s: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    huber_delta: float,
+    scale_prior_diag: float,
+):
+    """Build Huber-weighted SE3+scale blocks and costs in the CUDA extension."""
+    from . import cuda_backend as pgo_cuda
+
+    return pgo_cuda.build_se3_scale_weighted_blocks(
+        poses.data,
+        log_s,
+        rel_edges.poses.data,
+        prior_log_s,
+        ii,
+        jj,
+        sqrt_info,
+        huber_delta,
+        scale_prior_diag,
+    )
+
+
+def _se3_scale_cuda_candidate(
+    poses: SE3,
+    log_s: torch.Tensor,
+    step_full: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    rel_edges: RelativeEdges,
+    prior_log_s: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    robust: torch.Tensor,
+    anchor: int,
+    scale_prior_diag: float,
+):
+    """Evaluate one SE3+scale LM candidate step in the native CUDA extension."""
+    from . import cuda_backend as pgo_cuda
+
+    return pgo_cuda.evaluate_se3_scale_candidate(
+        poses.data,
+        log_s,
+        step_full,
+        rel_edges.poses.data,
+        prior_log_s,
+        ii,
+        jj,
+        sqrt_info,
+        robust,
+        anchor,
+        scale_prior_diag,
+    )
+
+
+def _se3_scale_cuda_stats(
+    poses: SE3,
+    log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    rel_edges: RelativeEdges,
+    prior_log_s: torch.Tensor,
+    sqrt_info: torch.Tensor,
+    scale_prior_diag: float,
+):
+    """Return final SE3+scale cost and residual summaries from the CUDA extension."""
+    from . import cuda_backend as pgo_cuda
+
+    return pgo_cuda.evaluate_se3_scale_stats(
+        poses.data,
+        log_s,
+        rel_edges.poses.data,
+        prior_log_s,
+        ii,
+        jj,
+        sqrt_info,
+        scale_prior_diag,
+    )
+
+
 def _optimize_rotation_pose_graph_cuda(
     poses: SE3,
     log_s: torch.Tensor,
@@ -128,7 +221,7 @@ def _optimize_rotation_pose_graph_cuda(
     lm_max_attempts: int,
     huber_delta: float,
 ) -> Sim3PGOResult:
-    """Rotation-only PGO using CUDA block assembly and cached Eigen sparse solve."""
+    """Rotation-only PGO using CUDA block assembly and cached Eigen solve."""
     from . import cuda_backend as pgo_cuda
 
     pose_data = poses.data
@@ -144,6 +237,7 @@ def _optimize_rotation_pose_graph_cuda(
         raise RuntimeError(f"backend='{backend_name}' requires CUDA float32 tensors")
 
     if n_nodes <= 1:
+        solver_variant = _eigen_solver_variant(n_nodes, 3, int(ii.numel()))
         return Sim3PGOResult(
             poses=poses.data,
             log_scales=log_s,
@@ -152,6 +246,7 @@ def _optimize_rotation_pose_graph_cuda(
                 "mode": "rotation_only",
                 "backend": backend_name,
                 **solver_info,
+                "linear_solver_variant": solver_variant,
                 "n_edges": int(ii.numel()),
                 "solver_failures": 0,
             },
@@ -164,6 +259,7 @@ def _optimize_rotation_pose_graph_cuda(
     rejected = 0
     solver_failures = 0
     lm = damping
+    solver_variant = _eigen_solver_variant(n_nodes, 3, int(ii.numel()))
     eigen_solver = pgo_cuda.RotationEigenSimplicialLLTSolver(ii, jj, n_nodes, anchor)
     unit_robust = torch.ones(ii.numel(), 1, device=device, dtype=dtype)
     for _ in range(n_iters):
@@ -228,6 +324,7 @@ def _optimize_rotation_pose_graph_cuda(
         "mode": "rotation_only",
         "backend": backend_name,
         **solver_info,
+        "linear_solver_variant": solver_variant,
         "n_edges": int(ii.numel()),
         "n_iters": int(n_iters),
         "lm_max_attempts": int(lm_max_attempts),
@@ -261,7 +358,7 @@ def _optimize_translation_scale_pose_graph_cuda(
     huber_delta: float,
     scale_conf: float,
 ) -> Sim3PGOResult:
-    """Translation+scale PGO using CUDA block assembly and cached Eigen sparse solve."""
+    """Translation+scale PGO using CUDA block assembly and cached Eigen solve."""
     from . import cuda_backend as pgo_cuda
 
     device = poses.data.device
@@ -283,6 +380,7 @@ def _optimize_translation_scale_pose_graph_cuda(
     rejected = 0
     solver_failures = 0
     lm = damping
+    solver_variant = _eigen_solver_variant(n_nodes, 4, int(ii.numel()))
     eigen_solver = pgo_cuda.TranslationScaleEigenSimplicialLLTSolver(ii, jj, n_nodes, anchor)
     unit_robust = torch.ones(ii.numel(), 1, device=device, dtype=dtype)
 
@@ -367,6 +465,7 @@ def _optimize_translation_scale_pose_graph_cuda(
         "mode": "translation_scale",
         "backend": backend_name,
         **solver_info,
+        "linear_solver_variant": solver_variant,
         "n_edges": int(ii.numel()),
         "n_iters": int(n_iters),
         "lm_max_attempts": int(lm_max_attempts),
@@ -400,7 +499,7 @@ def _optimize_se3_scale_pose_graph_cuda(
     huber_delta: float,
     scale_conf: float,
 ) -> Sim3PGOResult:
-    """SE3+scale PGO using CUDA block assembly and cached Eigen sparse solve."""
+    """SE3+scale PGO using CUDA block assembly and cached Eigen solve."""
     from . import cuda_backend as pgo_cuda
 
     device = poses.data.device
@@ -416,6 +515,7 @@ def _optimize_se3_scale_pose_graph_cuda(
         raise RuntimeError(f"backend='{backend_name}' requires CUDA float32 tensors")
 
     if n_nodes <= 1:
+        solver_variant = _eigen_solver_variant(n_nodes, 7, int(ii.numel()))
         return Sim3PGOResult(
             poses=poses.data,
             log_scales=log_s,
@@ -424,24 +524,30 @@ def _optimize_se3_scale_pose_graph_cuda(
                 "mode": "se3_scale",
                 "backend": backend_name,
                 **solver_info,
+                "linear_solver_variant": solver_variant,
                 "n_edges": int(ii.numel()),
                 "solver_failures": 0,
             },
         )
 
-    node_ids = torch.arange(n_nodes, device=device)
-    optimized_nodes = node_ids[node_ids != anchor]
     initial_cost = None
     accepted = 0
     rejected = 0
     solver_failures = 0
     lm = damping
+    solver_variant = _eigen_solver_variant(n_nodes, 7, int(ii.numel()))
     eigen_solver = pgo_cuda.Se3ScaleEigenSimplicialLLTSolver(ii, jj, n_nodes, anchor)
-    unit_robust = torch.ones(ii.numel(), 1, device=device, dtype=dtype)
     for _ in range(n_iters):
         with torch.no_grad():
-            p0 = _scale_prior_residuals(log_s, prior_log_s) * scale_sqrt_info
-            source_block, target_block, edge_residual, prior_gradient = _se3_scale_cuda_blocks(
+            (
+                source_block,
+                target_block,
+                edge_residual,
+                prior_gradient,
+                robust,
+                current_cost_value,
+                unrobust_cost,
+            ) = _se3_scale_cuda_weighted_blocks(
                 poses,
                 log_s,
                 ii,
@@ -449,52 +555,44 @@ def _optimize_se3_scale_pose_graph_cuda(
                 rel_edges,
                 prior_log_s,
                 sqrt_info,
-                unit_robust,
+                huber_delta,
                 scale_prior_diag,
             )
-            edge_norm = edge_residual.norm(dim=-1).clamp_min(EPS)
-            robust = torch.where(edge_norm <= huber_delta, torch.ones_like(edge_norm), huber_delta / edge_norm)
-            robust = robust.sqrt().unsqueeze(-1)
-            source_block = source_block * robust[:, :, None]
-            target_block = target_block * robust[:, :, None]
-            edge_residual = edge_residual * robust
-            current_cost = 0.5 * ((edge_residual ** 2).sum() + (p0 ** 2).sum())
             if initial_cost is None:
-                unrobust_residual = edge_residual / robust.clamp_min(EPS)
-                initial_cost = float((0.5 * ((unrobust_residual ** 2).sum() + (p0 ** 2).sum())).cpu())
+                initial_cost = unrobust_cost
 
         improved = False
         step_norm = 0.0
-        for _ in range(lm_max_attempts):
-            try:
-                step_full = eigen_solver.solve(
-                    source_block,
-                    target_block,
-                    edge_residual,
-                    prior_gradient,
-                    lm,
-                    scale_prior_diag,
-                )
-            except RuntimeError:
-                solver_failures += 1
-                lm = min(lm * LM_DAMPING_INCREASE, LM_DAMPING_MAX)
-                continue
-            pose_delta = step_full[optimized_nodes, :6]
-            scale_delta = step_full[:, 6]
-            cand_poses, cand_log_s = _apply_delta(poses, log_s, pose_delta, scale_delta, anchor)
-            cand_r = _scaled_se3_residuals(cand_poses, cand_log_s, ii, jj, rel_edges)
-            cand_p = _scale_prior_residuals(cand_log_s, prior_log_s) * scale_sqrt_info
-            cand_weighted = cand_r * sqrt_info * robust
-            cand_cost = 0.5 * ((cand_weighted ** 2).sum() + (cand_p ** 2).sum())
-            step_norm = float(step_full.norm().cpu())
-            if cand_cost <= current_cost:
-                poses, log_s = cand_poses, cand_log_s
-                lm = max(lm * LM_DAMPING_DECREASE, LM_DAMPING_MIN)
-                accepted += 1
-                improved = True
-                break
-            rejected += 1
-            lm = min(lm * LM_DAMPING_INCREASE, LM_DAMPING_MAX)
+        (
+            cand_pose_data,
+            cand_log_s,
+            _cand_cost,
+            step_norm,
+            lm,
+            improved,
+            rejected_attempts,
+            attempt_failures,
+        ) = eigen_solver.solve_lm_attempts(
+            source_block,
+            target_block,
+            edge_residual,
+            prior_gradient,
+            poses.data,
+            log_s,
+            rel_edges.poses.data,
+            prior_log_s,
+            sqrt_info,
+            robust,
+            current_cost_value,
+            lm,
+            lm_max_attempts,
+            scale_prior_diag,
+        )
+        solver_failures += int(attempt_failures)
+        rejected += int(rejected_attempts)
+        if improved:
+            poses, log_s = SE3(cand_pose_data), cand_log_s
+            accepted += 1
 
         if not improved:
             break
@@ -502,17 +600,30 @@ def _optimize_se3_scale_pose_graph_cuda(
         if step_norm < 1e-5:
             break
 
-    final_res = _scaled_se3_residuals(poses, log_s, ii, jj, rel_edges) * sqrt_info
-    final_prior = _scale_prior_residuals(log_s, prior_log_s) * scale_sqrt_info
-    edge_res = final_res.norm(dim=-1)
-    final_cost = float((0.5 * ((final_res ** 2).sum() + (final_prior ** 2).sum())).cpu())
-    finite = bool((torch.isfinite(final_res).all() & torch.isfinite(final_prior).all()).cpu())
+    (
+        final_cost,
+        edge_residual_mean,
+        edge_residual_max,
+        scale_prior_residual_mean,
+        scale_prior_residual_max,
+        finite,
+    ) = _se3_scale_cuda_stats(
+        poses,
+        log_s,
+        ii,
+        jj,
+        rel_edges,
+        prior_log_s,
+        sqrt_info,
+        scale_prior_diag,
+    )
     start_cost = final_cost if initial_cost is None else initial_cost
     info = {
         "success": finite and (n_iters == 0 or accepted > 0 or final_cost <= start_cost + 1e-6),
         "mode": "se3_scale",
         "backend": backend_name,
         **solver_info,
+        "linear_solver_variant": solver_variant,
         "n_edges": int(ii.numel()),
         "n_iters": int(n_iters),
         "lm_max_attempts": int(lm_max_attempts),
@@ -521,9 +632,9 @@ def _optimize_se3_scale_pose_graph_cuda(
         "solver_failures": solver_failures,
         "initial_cost": start_cost,
         "cost": final_cost,
-        "edge_residual_mean": float(edge_res.mean().cpu()),
-        "edge_residual_max": float(edge_res.max().cpu()),
-        "scale_prior_residual_mean": float(final_prior.abs().mean().cpu()),
-        "scale_prior_residual_max": float(final_prior.abs().max().cpu()),
+        "edge_residual_mean": edge_residual_mean,
+        "edge_residual_max": edge_residual_max,
+        "scale_prior_residual_mean": scale_prior_residual_mean,
+        "scale_prior_residual_max": scale_prior_residual_max,
     }
     return Sim3PGOResult(poses=poses.data, log_scales=log_s, info=info)

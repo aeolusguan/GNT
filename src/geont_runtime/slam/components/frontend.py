@@ -20,14 +20,14 @@
 
 import torch
 from geont.models import GeoNTWrapper
+from geont_runtime.utils.logging import pbar
 from .buffer import GraphBuffer
 from .factor_graph import FactorGraph
 
 
 class SLAMFrontend:
     """
-    Frontend is called given every new frame. Currently it is a no-op for non-keyframe frames.
-    For keyframe, it handles the system initialization and partial update logic (i.e. use GeoNT to get pose for this kf).
+    Offline frontend refinement over keyframes initialized by the one-pass initializer.
     """
 
     def __init__(self, net: GeoNTWrapper, video: GraphBuffer, args, device: torch.device):
@@ -38,19 +38,17 @@ class SLAMFrontend:
             video,
             device,
             max_factors=self.max_factors,
+            frontend_outlier_trans_conf_thresh=args.frontend_outlier_trans_conf_thresh,
         )
 
-        # Number of frames that the frontend has so far optimized.
         self.t1 = 0
-
-        # frontend variables
-        self.is_initialized = False
-
-        # Number of frames to wait before initializing (default 8)
-        self.warmup = args.warmup
+        self.initialized = True
         self.frontend_radius = args.frontend_radius
-        self.frontend_thresh = args.frontend_thresh
-        self.seq_init = args.seq_init
+        self.proximity_window = args.proximity_window
+        self.proximity_recent = args.proximity_recent
+        self.proximity_nms = args.proximity_nms
+        self.proximity_thresh = args.proximity_thresh
+        self.frontend_min_edges_per_source = args.frontend_min_edges_per_source
         self.pgo_iters = args.pgo_iters
         self.pgo_damping = args.pgo_damping
         self.pgo_lm_max_attempts = args.pgo_lm_max_attempts
@@ -61,7 +59,7 @@ class SLAMFrontend:
         self.pgo_backend = args.pgo_backend
         self.use_fp16 = args.use_fp16
 
-    def _run_pgo(self):
+    def _run_final_full_graph_pgo(self):
         return self.graph.optimize_finalized_pose_graph(
             anchor=0,
             n_iters=self.pgo_iters,
@@ -73,80 +71,78 @@ class SLAMFrontend:
             backend=self.pgo_backend,
         )
 
-    def _marginalize_oldest(self):
-        keyframe = self.graph.oldest_active_keyframe()
-        if keyframe is None:
-            return None
-        result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16)
-        return result
+    def _ready_keyframes(self, min_edges: int | None = None) -> list[int]:
+        if self.graph.ii.numel() == 0:
+            return []
 
-    def _marginalize_all(self):
+        keyframes, counts = torch.unique(self.graph.ii, return_counts=True)
+        if min_edges is not None:
+            keyframes = keyframes[counts >= int(min_edges)]
+        return [int(keyframe) for keyframe in keyframes.cpu().tolist()]
+
+    def _window_deadline_keyframes(self, end: int) -> list[int]:
+        if end < self.proximity_window or self.graph.ii.numel() == 0:
+            return []
+
+        last_in_window = end - self.proximity_window
+        keyframes = torch.unique(self.graph.ii)
+        keyframes = keyframes[keyframes <= int(last_in_window)]
+        return [int(keyframe) for keyframe in keyframes.cpu().tolist()]
+
+    def _marginalize_sources(self, min_edges: int | None = None) -> bool:
         marginalized = False
-        while self.graph.ii.numel() > 0:
-            if self._marginalize_oldest() is None:
-                break
+        for keyframe in self._ready_keyframes(min_edges=min_edges):
+            result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16)
+            if result is None:
+                continue
             marginalized = True
-        if marginalized:
-            self._run_pgo()
+        return marginalized
 
-    def finish(self):
-        """Flush the active graph at the end of a finite stream."""
-        if not self.is_initialized:
-            if self.video.n_frames <= 1:
-                return
-            self.__initialize()
+    def _marginalize_window_deadline_sources(self, end: int) -> bool:
+        marginalized = False
+        for keyframe in self._window_deadline_keyframes(end):
+            result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16)
+            if result is None:
+                raise RuntimeError(f"deadline source keyframe {keyframe} has no factors to marginalize")
+            marginalized = True
+        return marginalized
 
-        self._marginalize_all()
+    def _marginalize_until_within_budget(self) -> bool:
+        if self.max_factors <= 0:
+            return False
 
-    def run_second_pass(self):
+        marginalized = False
+        while self.graph.active_edge_count() > self.max_factors:
+            keyframe = self.graph.oldest_active_keyframe()
+            if keyframe is None:
+                raise RuntimeError("active frontend edge budget exceeded but no active keyframe exists")
+            result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16)
+            if result is None:
+                raise RuntimeError(f"active source keyframe {keyframe} has no factors to marginalize")
+            marginalized = True
+        return marginalized
+
+    def run(self, initialized_edges):
         """Refine initialized keyframes with projection-proximity factors."""
         if self.video.n_frames <= 1:
             return
 
+        assert self.initialized
+        assert self.graph.ii.numel() == 0
         self.t1 = self.video.n_frames
-        self.is_initialized = True
-        self.graph.add_proximity_factors(
-            0,
-            self.t1,
-            thresh=self.frontend_thresh,
-        )
-        self._marginalize_all()
+        self.graph.edges.add_from(initialized_edges)
 
-    def __initialize(self):
-        """initialize the SLAM system with keyframe idx [t0, t1)"""
+        for end in pbar(range(2, self.t1 + 1), desc="Offline frontend sweep"):
+            source_start = max(end - self.proximity_recent, 0)
+            window_start = max(end - self.proximity_window, 0)
+            self.graph.add_proximity_factors(
+                source_start,
+                window_start,
+                end,
+                radius=self.frontend_radius,
+                nms=self.proximity_nms,
+                thresh=self.proximity_thresh,
+            )
 
-        self.t1 = self.video.n_frames
-
-        self.graph.add_neighborhood_factors(
-            0,
-            self.t1,
-            r=1 if self.seq_init else self.frontend_radius,
-            thresh=self.frontend_thresh,
-        )
-        self.is_initialized = True
-
-    def __update(self):
-        """Add temporal neighborhood factors for newly added keyframes."""
-        prev_t1 = self.t1
-        self.t1 = self.video.n_frames
-        if self.t1 <= prev_t1:
-            return
-
-        self.graph.increment_age()
-        self.graph.add_neighborhood_factors(
-            max(0, self.t1 - self.frontend_radius - 1),
-            self.t1,
-            r=self.frontend_radius,
-            thresh=self.frontend_thresh,
-        )
-        
-    def run(self):
-        """main update"""
-
-        # do initialization
-        if not self.is_initialized and self.video.n_frames == self.warmup:
-            self.__initialize()
-
-        # do update if new keyframe is added.
-        elif self.is_initialized and self.t1 < self.video.n_frames:
-            self.__update()
+        self._marginalize_sources()
+        self._run_final_full_graph_pgo()

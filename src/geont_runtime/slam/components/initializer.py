@@ -45,8 +45,12 @@ class OnePassInitializer:
         if keyframe is None:
             return None
 
-        result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16)
+        result = self.graph.marginalize_keyframe(keyframe, use_fp16=self.use_fp16, decode_depth=True)
         if result is not None:
+            self.video.depths[keyframe, 0] = result["refined_depth"].to(dtype=self.video.depths.dtype)
+            self.video.depths_sens_scale[keyframe, 0] = result["source_scale"].to(
+                dtype=self.video.depths_sens_scale.dtype
+            )
             self.edges.add(
                 result["ii"],
                 result["jj"],
