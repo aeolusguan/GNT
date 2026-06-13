@@ -29,13 +29,11 @@ class SLAMBackend:
         self.local_edge_outlier_trans_conf_thresh = float(args.local_edge_outlier_trans_conf_thresh)
         self.local_edge_max_rotation_deg = float(args.get("local_edge_max_rotation_deg", 30.0))
         self.local_edge_max_translation = float(args.get("local_edge_max_translation", 5.0))
-        self.local_mapping_window = int(args.get("local_mapping_window", 8))
+        self.local_mapping_window = int(args.get("local_mapping_window", 25))
         self.local_mapping_radius = int(args.get("local_mapping_radius", 2))
         self.local_mapping_nms = int(args.get("local_mapping_nms", 1))
         self.local_mapping_thresh = float(args.get("local_mapping_thresh", 16.0))
         self.local_pgo_every = int(args.get("local_pgo_every", 1))
-        self.local_refine_depth = bool(args.get("local_refine_depth", True))
-        self.depth_refine_observability_topk = int(args.get("depth_refine_observability_topk", 4))
         self.pgo_iters = args.pgo_iters
         self.pgo_damping = args.pgo_damping
         self.pgo_lm_max_attempts = args.pgo_lm_max_attempts
@@ -47,55 +45,67 @@ class SLAMBackend:
 
         self.local_edge_outlier_info = make_local_edge_outlier_info(self.local_edge_outlier_trans_conf_thresh)
         self.backend_info = {
-            "depth_refine_observability_topk": self.depth_refine_observability_topk,
-            "depth_observability_selected_neighbor_count": 0,
-            "depth_observability_selected_neighbor_count_min": 0,
-            "depth_observability_selected_neighbor_count_mean": 0.0,
-            "depth_observability_selected_neighbor_count_max": 0,
+            "local_mapping_radius": self.local_mapping_radius,
             "pose_edges_added": 0,
-            "depth_refine_runs": 0,
+            "temporal_finalize_runs": 0,
+            "temporal_edges_added": 0,
+            "proximity_edges_added": 0,
             "local_pgo_runs": 0,
             "global_pgo_runs": 0,
         }
-        self._selected_neighbor_count_sum = 0
-        self._selected_neighbor_count_min: int | None = None
-        self._selected_neighbor_count_max = 0
-
-    def _record_selected_neighbor_count(self, count: int) -> None:
-        count = int(count)
-        self.backend_info["depth_observability_selected_neighbor_count"] += 1
-        self._selected_neighbor_count_sum += count
-        self._selected_neighbor_count_min = count if self._selected_neighbor_count_min is None else min(
-            self._selected_neighbor_count_min,
-            count,
-        )
-        self._selected_neighbor_count_max = max(self._selected_neighbor_count_max, count)
-        n = self.backend_info["depth_observability_selected_neighbor_count"]
-        self.backend_info["depth_observability_selected_neighbor_count_min"] = int(self._selected_neighbor_count_min)
-        self.backend_info["depth_observability_selected_neighbor_count_mean"] = float(
-            self._selected_neighbor_count_sum / n
-        )
-        self.backend_info["depth_observability_selected_neighbor_count_max"] = int(self._selected_neighbor_count_max)
+        self._temporal_finalized: set[int] = set()
 
     def _record_local_edge_outlier_info(self, info: dict, duplicate_filtered_after_gate: int) -> None:
         record_local_edge_outlier_info(self.local_edge_outlier_info, info, duplicate_filtered_after_gate)
         self.graph.edges.pgo_info.update(self.local_edge_outlier_info)
 
-    def update_local_graph(self, current_keyframe: int) -> torch.Tensor:
-        if current_keyframe <= 0:
-            return torch.as_tensor([], dtype=torch.long, device=self.graph.device)
+    def _temporal_neighbors(self, source: int) -> torch.Tensor:
+        start = max(0, int(source) - self.local_mapping_radius)
+        end = min(self.buffer.n_frames, int(source) + self.local_mapping_radius + 1)
+        neighbors = torch.arange(start, end, device=self.device, dtype=torch.long)
+        return neighbors[neighbors != int(source)]
 
+    def _finalize_temporal_keyframe(self, source: int) -> None:
+        source = int(source)
+        if source in self._temporal_finalized:
+            return
+
+        neighbors = self._temporal_neighbors(source)
+        if neighbors.numel() == 0:
+            return
+
+        result = self.measurements.measure_multiview_pose_depth(source, neighbors)
+        refined_depth = result["refined_depth"].float()
+        mask = self.buffer.non_sky_masks[source, 0]
+        if mask.any():
+            source_mean = self.buffer.depths_sens_normed[source, 0].float()[mask].mean().clamp_min(1e-6)
+            refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
+            self.buffer.depths_sens_scale[source, 0] *= source_mean / refined_mean
+        self.buffer.depths[source, 0] = refined_depth.to(dtype=self.buffer.depths.dtype)
+        self.buffer.depth_status[source] = DEPTH_STATUS_REFINED
+        self.buffer.depth_dirty[source] = True
+        added = self.graph.add_measurement_result(result)
+        n_added = int(added["n_added"])
+        self.backend_info["temporal_finalize_runs"] += 1
+        self.backend_info["temporal_edges_added"] += n_added
+        self.backend_info["pose_edges_added"] += n_added
+        self._temporal_finalized.add(source)
+
+    def _add_nonlocal_proximity_edges(self, current_keyframe: int, finalized_source_end: int) -> None:
         window_start = max(0, current_keyframe + 1 - self.local_mapping_window)
-        ii, jj = self.graph.select_proximity_edges(
+        if finalized_source_end <= window_start:
+            return
+
+        ii, jj = self.graph.select_nonlocal_proximity_edges(
             window_start,
             window_start,
-            current_keyframe + 1,
+            int(finalized_source_end),
             radius=self.local_mapping_radius,
             nms=self.local_mapping_nms,
             thresh=self.local_mapping_thresh,
         )
         if ii.numel() == 0:
-            return ii
+            return
 
         result = self.measurements.predict_pose_edges(ii, jj)
         result = filter_local_edge_measurement(
@@ -112,49 +122,25 @@ class SLAMBackend:
             ),
             int(result["n_duplicates"]),
         )
-        self.backend_info["pose_edges_added"] += int(result["n_added"])
-        return result["changed_sources"]
+        n_added = int(result["n_added"])
+        self.backend_info["proximity_edges_added"] += n_added
+        self.backend_info["pose_edges_added"] += n_added
 
-    def _commit_refined_depth(self, keyframe: int, refined_depth: torch.Tensor) -> None:
-        refined_depth = refined_depth.float()
-        mask = self.buffer.non_sky_masks[keyframe, 0]
-        depth_scale = torch.ones((), device=refined_depth.device, dtype=refined_depth.dtype)
-        if mask.any():
-            source_mean = self.buffer.depths[keyframe, 0].float()[mask].mean().clamp_min(1e-6)
-            refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
-            depth_scale = source_mean / refined_mean
-        self.buffer.depths[keyframe, 0] = (refined_depth * depth_scale).to(dtype=self.buffer.depths.dtype)
-        self.buffer.depth_status[keyframe] = DEPTH_STATUS_REFINED
-        self.buffer.depth_dirty[keyframe] = True
-
-    def refine_changed_sources(self, sources: torch.Tensor, current_keyframe: int) -> None:
-        if not self.local_refine_depth or sources.numel() == 0:
+    def update_local_graph(self, current_keyframe: int) -> None:
+        if current_keyframe <= 0:
             return
 
-        window_start = max(0, current_keyframe + 1 - self.local_mapping_window)
-        window_end = current_keyframe + 1
-        for source in torch.unique(sources).cpu().tolist():
-            neighbors = self.graph.edge_neighbors(int(source), window_start=window_start, window_end=window_end)
-            selected_neighbors = self.graph.edges.select_depth_observability_topk(
-                int(source),
-                neighbors,
-                self.depth_refine_observability_topk,
-            )
-            refined = self.measurements.refine_depth(
-                int(source),
-                selected_neighbors,
-            )
-            if refined is None:
-                continue
-            self.graph.edges.update_depth_observability(
-                torch.full_like(selected_neighbors, int(source)),
-                selected_neighbors,
-                refined["observability_logits"],
-                rank=2,
-            )
-            self._commit_refined_depth(int(source), refined["refined_depth"])
-            self._record_selected_neighbor_count(int(selected_neighbors.numel()))
-            self.backend_info["depth_refine_runs"] += 1
+        mature_source = int(current_keyframe) - self.local_mapping_radius
+        if mature_source < 0:
+            return
+
+        self._finalize_temporal_keyframe(mature_source)
+        self._add_nonlocal_proximity_edges(current_keyframe, finalized_source_end=mature_source + 1)
+
+    def finalize_pending_keyframes(self) -> None:
+        for source in range(self.buffer.n_frames):
+            self._finalize_temporal_keyframe(source)
+        self._add_nonlocal_proximity_edges(self.buffer.n_frames - 1, finalized_source_end=self.buffer.n_frames)
 
     def optimize_local_window(self, current_keyframe: int) -> None:
         if self.local_pgo_every <= 0:

@@ -37,8 +37,11 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
     xgrid = 2*xgrid/(W-1) - 1
     ygrid = 2*ygrid/(H-1) - 1
 
-    grid = torch.cat([xgrid, ygrid], dim=-1)
-    img = F.grid_sample(img, grid, align_corners=True)
+    grid = torch.cat([xgrid, ygrid], dim=-1).contiguous()
+    # CorrBlock flattens correlation volumes as batch*h*w, which can exceed
+    # cuDNN grid_sample's supported layouts even when tensors are contiguous.
+    with torch.backends.cudnn.flags(enabled=False):
+        img = F.grid_sample(img.contiguous(), grid, align_corners=True)
 
     if mask:
         mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)

@@ -178,13 +178,11 @@ class TransformerDecoder(nn.Module):
         aggregated_tokens_list,
         res_feat,
         img_shape,
-        *,
-        return_observability_logits: bool = False,
     ):
         # only use the last layer's output
         aggregated_tokens = aggregated_tokens_list[-1]
-        observability_logits = self.gate(aggregated_tokens[0]).squeeze(-1)
-        gates = torch.softmax(observability_logits, dim=1).unsqueeze(-1)
+        gate_logits = self.gate(aggregated_tokens[0]).squeeze(-1)
+        gates = torch.softmax(gate_logits, dim=1).unsqueeze(-1)
         hidden = (aggregated_tokens[0] * gates).sum(dim=1)  # B,N,C
         hidden = self.projects(hidden)  # B,N,4C
 
@@ -213,10 +211,6 @@ class TransformerDecoder(nn.Module):
         out = out.permute(0, 2, 3, 1)  # B,H,W,C
         pred = self._apply_activation_single(out[..., :-1], activation=self.activation)
         conf = self._apply_activation_single(out[..., -1], activation=self.conf_activation)
-        if return_observability_logits:
-            return pred.squeeze(-1), conf, {
-                "observability_logits": observability_logits,
-            }
         return pred.squeeze(-1), conf
     
     def _apply_activation_single(

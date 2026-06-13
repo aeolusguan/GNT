@@ -34,21 +34,39 @@ class PoseGraphEdges:
     def __init__(self, device: torch.device):
         self.ii = torch.as_tensor([], dtype=torch.long, device=device)
         self.jj = torch.as_tensor([], dtype=torch.long, device=device)
+        self.edge_key = torch.as_tensor([], dtype=torch.long, device=device)
         self.relative_pose = torch.zeros([0, 7], device=device, dtype=torch.float)
         self.relative_scale = torch.zeros([0], device=device, dtype=torch.float)
         self.confidence = torch.zeros([0, 2], device=device, dtype=torch.float)
-        self.depth_observability_score = torch.zeros([0], device=device, dtype=torch.float)
-        self.depth_observability_rank = torch.zeros([0], device=device, dtype=torch.uint8)
         self.pgo_info = {}
         self.pgo_replay = {}
-        self._edge_set: set[tuple[int, int]] = set()
+        self._edge_key_stride = 1_000_000
 
-    def _sync_edge_set(self) -> set[tuple[int, int]]:
-        if len(self._edge_set) != int(self.ii.numel()):
-            self._edge_set = {
-                (int(i), int(j)) for i, j in zip(self.ii.cpu().tolist(), self.jj.cpu().tolist())
-            }
-        return self._edge_set
+    def _make_edge_key(self, ii: torch.Tensor, jj: torch.Tensor) -> torch.Tensor:
+        return ii.long() * self._edge_key_stride + jj.long()
+
+    def _first_unique_mask(self, keys: torch.Tensor) -> torch.Tensor:
+        if keys.numel() == 0:
+            return torch.zeros_like(keys, dtype=torch.bool)
+        _, inverse = torch.unique(keys, sorted=False, return_inverse=True)
+        positions = torch.arange(keys.numel(), device=keys.device, dtype=torch.long)
+        first = torch.full(
+            (int(inverse.max().item()) + 1,),
+            keys.numel(),
+            device=keys.device,
+            dtype=torch.long,
+        )
+        first.scatter_reduce_(0, inverse, positions, reduce="amin", include_self=True)
+        keep = torch.zeros(keys.numel(), device=keys.device, dtype=torch.bool)
+        keep[first] = True
+        return keep
+
+    def new_edge_mask(self, ii: torch.Tensor, jj: torch.Tensor) -> torch.Tensor:
+        keys = self._make_edge_key(ii, jj)
+        keep = self._first_unique_mask(keys)
+        if self.edge_key.numel() > 0:
+            keep &= ~torch.isin(keys, self.edge_key)
+        return keep
 
     def add(
         self,
@@ -57,42 +75,19 @@ class PoseGraphEdges:
         pose: torch.Tensor,
         scale: torch.Tensor,
         confidence: torch.Tensor,
-        observability_score: torch.Tensor,
-        observability_rank: torch.Tensor,
     ) -> torch.Tensor:
         assert ii.shape == jj.shape
-        assert observability_score.shape == ii.shape
-        assert observability_rank.shape == ii.shape
-        assert (observability_rank > 0).all()
-        assert torch.isfinite(observability_score).all()
-        existing = set(self._sync_edge_set())
-        keep = []
-        for idx, (i, j) in enumerate(zip(ii.cpu().tolist(), jj.cpu().tolist())):
-            directed_pair = (int(i), int(j))
-            if directed_pair in existing:
-                continue
-            keep.append(idx)
-            existing.add(directed_pair)
-        if not keep:
+        keep_mask = self.new_edge_mask(ii, jj)
+        if not keep_mask.any():
             return torch.zeros(ii.shape[0], device=ii.device, dtype=torch.bool)
 
-        keep_idx = torch.as_tensor(keep, device=ii.device, dtype=torch.long)
-        keep_mask = torch.zeros(ii.shape[0], device=ii.device, dtype=torch.bool)
-        keep_mask[keep_idx] = True
+        keep_idx = torch.nonzero(keep_mask, as_tuple=False).flatten()
         self.ii = torch.cat((self.ii, ii[keep_idx].long()), dim=0)
         self.jj = torch.cat((self.jj, jj[keep_idx].long()), dim=0)
+        self.edge_key = torch.cat((self.edge_key, self._make_edge_key(ii[keep_idx], jj[keep_idx])), dim=0)
         self.relative_pose = torch.cat((self.relative_pose, pose[keep_idx].float()), dim=0)
         self.relative_scale = torch.cat((self.relative_scale, scale[keep_idx].float()), dim=0)
         self.confidence = torch.cat((self.confidence, confidence[keep_idx].float()), dim=0)
-        self.depth_observability_score = torch.cat(
-            (self.depth_observability_score, observability_score[keep_idx].float()),
-            dim=0,
-        )
-        self.depth_observability_rank = torch.cat(
-            (self.depth_observability_rank, observability_rank[keep_idx].to(dtype=torch.uint8)),
-            dim=0,
-        )
-        self._edge_set = existing
         return keep_mask
 
     def add_from(self, other) -> int:
@@ -102,66 +97,10 @@ class PoseGraphEdges:
             other.relative_pose,
             other.relative_scale,
             other.confidence,
-            other.depth_observability_score,
-            other.depth_observability_rank,
         )
         self.pgo_info = dict(other.pgo_info)
         self.pgo_replay = dict(other.pgo_replay)
         return int(keep.sum().item())
-
-    def update_depth_observability(
-        self,
-        ii: torch.Tensor,
-        jj: torch.Tensor,
-        observability_logits: torch.Tensor,
-        *,
-        rank: int,
-    ) -> None:
-        assert ii.numel() == jj.numel()
-        assert observability_logits.shape[0] == int(ii.numel())
-        scores = observability_logits.float().flatten(1).mean(dim=1).to(device=self.depth_observability_score.device)
-        assert torch.isfinite(scores).all()
-        edge_to_index = {
-            (int(i), int(j)): idx
-            for idx, (i, j) in enumerate(zip(self.ii.cpu().tolist(), self.jj.cpu().tolist()))
-        }
-        edge_indices = torch.as_tensor(
-            [edge_to_index[(int(i), int(j))] for i, j in zip(ii.cpu().tolist(), jj.cpu().tolist())],
-            dtype=torch.long,
-            device=self.depth_observability_score.device,
-        )
-        if int(rank) == 1:
-            update = self.depth_observability_rank[edge_indices] == 0
-            edge_indices = edge_indices[update]
-            scores = scores[update]
-        if edge_indices.numel() == 0:
-            return
-        self.depth_observability_score[edge_indices] = scores
-        self.depth_observability_rank[edge_indices] = int(rank)
-
-    def select_depth_observability_topk(
-        self,
-        source: int,
-        neighbors: torch.Tensor,
-        topk: int | None,
-    ) -> torch.Tensor:
-        if topk is None or int(topk) >= int(neighbors.numel()):
-            return neighbors
-
-        edge_to_index = {(int(i), int(j)): idx for idx, (i, j) in enumerate(zip(self.ii.cpu().tolist(), self.jj.cpu().tolist()))}
-        edge_indices = torch.as_tensor(
-            [edge_to_index[(int(source), int(neighbor))] for neighbor in neighbors.cpu().tolist()],
-            dtype=torch.long,
-            device=neighbors.device,
-        )
-        ranks = self.depth_observability_rank[edge_indices]
-        if (ranks == 0).any():
-            missing = neighbors[ranks == 0].cpu().tolist()
-            raise RuntimeError(f"missing depth observability cache for directed edges from {source}: {missing[:8]}")
-
-        score_tensor = self.depth_observability_score[edge_indices].to(device=neighbors.device)
-        topk_indices = torch.topk(score_tensor, min(int(topk), int(neighbors.numel())), dim=0).indices
-        return neighbors[topk_indices]
 
 
 class FactorGraph:
@@ -193,46 +132,25 @@ class FactorGraph:
         )
 
     def _filter_new_edges(self, ii: torch.Tensor, jj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        existing = set(self.edges._sync_edge_set())
-        keep = []
-        for idx, (i, j) in enumerate(zip(ii.cpu().tolist(), jj.cpu().tolist())):
-            directed_pair = (int(i), int(j))
-            if directed_pair in existing:
-                continue
-            keep.append(idx)
-            existing.add(directed_pair)
-        if not keep:
+        keep = self.edges.new_edge_mask(ii, jj)
+        if not keep.any():
             empty = torch.as_tensor([], dtype=torch.long, device=ii.device)
             return empty, empty
-        keep = torch.as_tensor(keep, dtype=torch.long, device=ii.device)
         return ii[keep], jj[keep]
 
     def add_measurement_result(self, result: dict) -> dict:
         n_candidates = int(result["ii"].numel())
-        observability_logits = result["depth_observability_logits"]
-        assert observability_logits.shape[0] == n_candidates
-        observability_score = observability_logits.float().flatten(1).mean(dim=1)
-        observability_rank = torch.full(
-            result["ii"].shape,
-            int(result["depth_observability_rank"]),
-            device=result["ii"].device,
-            dtype=torch.uint8,
-        )
         keep = self.edges.add(
             result["ii"],
             result["jj"],
             result["relative_pose"],
             self.buffer.depths_sens_scale[result["ii"], 0].float(),
             result["confidence"],
-            observability_score,
-            observability_rank,
         )
         n_added = int(keep.sum().item())
-        added_ii = result["ii"][keep] if n_added > 0 else torch.as_tensor([], dtype=torch.long, device=self.device)
         out = dict(result)
         out["n_added"] = n_added
         out["n_duplicates"] = n_candidates - n_added
-        out["changed_sources"] = torch.unique(added_ii) if n_added > 0 else added_ii
         return out
 
     def _bidirectional_pairs(self, ii: torch.Tensor, jj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -279,7 +197,7 @@ class FactorGraph:
         selected_jj = torch.as_tensor([pair[1] for pair in selected], dtype=torch.long, device=self.device)
         return selected_ii, selected_jj
 
-    def select_proximity_edges(
+    def select_nonlocal_proximity_edges(
         self,
         source_start: int,
         target_start: int,
@@ -297,47 +215,27 @@ class FactorGraph:
         ii, jj = torch.meshgrid(sources, targets, indexing="ij")
         ii = ii.reshape(-1).long()
         jj = jj.reshape(-1).long()
-        selected_ii_chunks: list[torch.Tensor] = []
-        selected_jj_chunks: list[torch.Tensor] = []
-
-        local = (ii > jj) & ((ii - jj) <= int(radius))
-        local_ii, local_jj = self._bidirectional_pairs(ii[local], jj[local])
-        local_ii, local_jj = self._filter_new_edges(local_ii, local_jj)
-        if local_ii.numel() > 0:
-            selected_ii_chunks.append(local_ii)
-            selected_jj_chunks.append(local_jj)
 
         proximity = (ii - jj) > int(radius)
-        cand_ii, cand_jj = self._filter_new_edges(ii[proximity], jj[proximity])
-        if cand_ii.numel() > 0:
-            distance = self.projection_distance(cand_ii, cand_jj)
-            keep = distance <= float(thresh)
-            if keep.any():
-                cand_ii, cand_jj, distance = cand_ii[keep], cand_jj[keep], distance[keep]
-                prox_ii, prox_jj = self._select_proximity_nms(
-                    cand_ii,
-                    cand_jj,
-                    distance,
-                    nms=int(nms),
-                    max_pairs=-1,
-                )
-                prox_ii, prox_jj = self._bidirectional_pairs(prox_ii, prox_jj)
-                prox_ii, prox_jj = self._filter_new_edges(prox_ii, prox_jj)
-                if prox_ii.numel() > 0:
-                    selected_ii_chunks.append(prox_ii)
-                    selected_jj_chunks.append(prox_jj)
-
-        if not selected_ii_chunks:
+        ii, jj = self._filter_new_edges(ii[proximity], jj[proximity])
+        if ii.numel() == 0:
             return empty, empty
-        return torch.cat(selected_ii_chunks), torch.cat(selected_jj_chunks)
 
-    def edge_neighbors(self, source: int, *, window_start: int | None = None, window_end: int | None = None) -> torch.Tensor:
-        mask = self.edges.ii == int(source)
-        if window_start is not None:
-            mask &= self.edges.jj >= int(window_start)
-        if window_end is not None:
-            mask &= self.edges.jj < int(window_end)
-        return self.edges.jj[mask]
+        distance = self.projection_distance(ii, jj)
+        keep = distance <= float(thresh)
+        if not keep.any():
+            return empty, empty
+
+        ii, jj, distance = ii[keep], jj[keep], distance[keep]
+        ii, jj = self._select_proximity_nms(
+            ii,
+            jj,
+            distance,
+            nms=int(nms),
+            max_pairs=-1,
+        )
+        ii, jj = self._bidirectional_pairs(ii, jj)
+        return self._filter_new_edges(ii, jj)
 
     def optimize_pose_graph(
         self,

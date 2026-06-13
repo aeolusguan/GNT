@@ -28,27 +28,27 @@ class GeoNTMeasurements:
 
     @torch.no_grad()
     def patch_embed(self, ii: torch.Tensor, jj: torch.Tensor) -> torch.Tensor:
-        fmap1 = self.buffer.fmaps[ii, 0].float()
-        fmap2 = self.buffer.fmaps[jj, 0].float()
-        bases = self.buffer.bases[ii, 0].float()
-        intrinsics = self.buffer.intrinsics[0:1].expand(fmap1.shape[0], -1)
+        fmap1 = self.buffer.fmaps[ii, 0].float().contiguous()
+        fmap2 = self.buffer.fmaps[jj, 0].float().contiguous()
+        bases = self.buffer.bases[ii, 0].float().contiguous()
+        intrinsics = self.buffer.intrinsics[0:1].expand(fmap1.shape[0], -1).contiguous()
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             return self.net.encode_flow(fmap1, fmap2, bases, intrinsics)
 
     @torch.no_grad()
     def patch_embed_candidate(self, keyframe_candidate: KeyframeCandidate, jj: torch.Tensor) -> torch.Tensor:
-        fmap1 = keyframe_candidate.fmap.expand(jj.numel(), -1, -1, -1).float()
-        fmap2 = self.buffer.fmaps[jj, 0].float()
-        bases = keyframe_candidate.bases.expand(jj.numel(), -1, -1, -1).float()
-        intrinsics = keyframe_candidate.intrinsics.expand(jj.numel(), -1)
+        fmap1 = keyframe_candidate.fmap.expand(jj.numel(), -1, -1, -1).float().contiguous()
+        fmap2 = self.buffer.fmaps[jj, 0].float().contiguous()
+        bases = keyframe_candidate.bases.expand(jj.numel(), -1, -1, -1).float().contiguous()
+        intrinsics = keyframe_candidate.intrinsics.expand(jj.numel(), -1).contiguous()
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             return self.net.encode_flow(fmap1, fmap2, bases, intrinsics)
 
     @torch.no_grad()
     def coarse_flow_motion_score(self, source: int, keyframe_candidate: KeyframeCandidate) -> float:
-        fmap1 = self.buffer.fmaps[source : source + 1, 0].float()
-        fmap2 = keyframe_candidate.fmap.float()
-        bases = self.buffer.bases[source : source + 1, 0].float()
+        fmap1 = self.buffer.fmaps[source : source + 1, 0].float().contiguous()
+        fmap2 = keyframe_candidate.fmap.float().contiguous()
+        bases = self.buffer.bases[source : source + 1, 0].float().contiguous()
         with torch.amp.autocast(device_type=self.device.type, enabled=False):
             delta, _ = self.net.flow_init(fmap1, fmap2, bases)
         dense_flow = delta.norm(dim=1)
@@ -62,7 +62,7 @@ class GeoNTMeasurements:
         mask: torch.Tensor,
         *,
         camera_prior: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         assert depth.ndim == 3
         assert mask.shape == depth.shape
         assert motion_tokens.shape[0] == depth.shape[0]
@@ -79,8 +79,7 @@ class GeoNTMeasurements:
             )
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
             pose_enc, pose_confidence = self.net.gnt.cam_dec(feats[-1][1])
-            observability_logits = self.net.gnt.depth_head.gate(feats[-1][0].float()).squeeze(-1).squeeze(1)
-        return pose_enc.squeeze(1), pose_confidence.squeeze(1), observability_logits
+        return pose_enc.squeeze(1), pose_confidence.squeeze(1)
 
     @torch.no_grad()
     def run_multiview_pose_depth_from_motion_tokens(
@@ -112,19 +111,16 @@ class GeoNTMeasurements:
         res_feat = self.net.gnt.res_depth_embed(depthmap)
         height, width = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            refined_depth, depth_confidence, depth_info = self.net.gnt.depth_head(
+            refined_depth, depth_confidence = self.net.gnt.depth_head(
                 feats,
                 res_feat,
                 img_shape=(height, width),
-                return_observability_logits=True,
             )
-        observability_logits = depth_info["observability_logits"].squeeze(0)
         return {
             "pose": pose_enc.squeeze(0),
             "pose_confidence": pose_confidence.squeeze(0),
             "refined_depth": refined_depth.squeeze(0),
             "depth_confidence": depth_confidence.squeeze(0),
-            "observability_logits": observability_logits,
         }
 
     def make_pose_measurement(
@@ -156,25 +152,20 @@ class GeoNTMeasurements:
         motion_tokens = self.patch_embed(ii, jj)
         depth = self.buffer.depths_sens_normed[ii, 0].float()
         mask = self.buffer.non_sky_masks[ii, 0]
-        pose, confidence, observability_logits = self._run_one_view_pose_from_motion_tokens(
+        pose, confidence = self._run_one_view_pose_from_motion_tokens(
             motion_tokens,
             depth,
             mask,
             camera_prior=camera_prior,
         )
-        result = self.make_pose_measurement(ii, jj, pose, confidence)
-        result["depth_observability_logits"] = observability_logits
-        result["depth_observability_rank"] = 1
-        return result
+        return self.make_pose_measurement(ii, jj, pose, confidence)
 
-    def refine_depth(
+    def measure_multiview_pose_depth(
         self,
         source: int,
         neighbors: torch.Tensor,
-    ) -> dict | None:
-        if neighbors.numel() == 0:
-            return None
-
+    ) -> dict:
+        assert neighbors.numel() > 0
         ii = torch.full_like(neighbors, int(source))
         motion_tokens = self.patch_embed(ii, neighbors)
         depth = self.buffer.depths_sens_normed[source, 0].float()
@@ -184,8 +175,11 @@ class GeoNTMeasurements:
             depth,
             mask,
         )
-        return {
-            "refined_depth": output["refined_depth"],
-            "depth_confidence": output["depth_confidence"],
-            "observability_logits": output["observability_logits"],
-        }
+        result = self.make_pose_measurement(ii, neighbors, output["pose"], output["pose_confidence"])
+        result.update(
+            {
+                "refined_depth": output["refined_depth"],
+                "depth_confidence": output["depth_confidence"],
+            }
+        )
+        return result

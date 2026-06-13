@@ -178,13 +178,7 @@ def add_loop_closure_edges(
     pose = torch.stack(pose_values, dim=0)
     scale = torch.stack(scale_values, dim=0)
     edge_conf = torch.stack(confidence_values, dim=0)
-    observability_score = torch.as_tensor(
-        [float(measurement.n_matches) for measurement in measurements for _ in range(2)],
-        dtype=torch.float32,
-        device=device,
-    )
-    observability_rank = torch.full((ii.numel(),), 1, dtype=torch.uint8, device=device)
-    keep = graph.edges.add(ii, jj, pose, scale, edge_conf, observability_score, observability_rank)
+    keep = graph.edges.add(ii, jj, pose, scale, edge_conf)
     return int(keep.sum().item())
 
 

@@ -114,7 +114,6 @@ class SLAMSystem:
         self.frontend = SLAMFrontend(
             self.measurements,
             self.buffer,
-            self.graph,
             self.config,
             device=self.device,
         )
@@ -169,8 +168,6 @@ class SLAMSystem:
                 "relative_pose": edges.relative_pose,
                 "relative_scale": edges.relative_scale,
                 "confidence": edges.confidence,
-                "depth_observability_score": edges.depth_observability_score,
-                "depth_observability_rank": edges.depth_observability_rank,
             },
             pgo_info=dict(edges.pgo_info),
             pgo_replay=dict(edges.pgo_replay),
@@ -201,14 +198,10 @@ class SLAMSystem:
             if current_keyframe == 0:
                 continue
 
-            changed_sources = [
-                self.backend.update_local_graph(current_keyframe),
-            ]
-            changed_sources = [sources for sources in changed_sources if sources.numel() > 0]
-            if changed_sources:
-                self.backend.refine_changed_sources(torch.unique(torch.cat(changed_sources)), current_keyframe)
+            self.backend.update_local_graph(current_keyframe)
             self.backend.optimize_local_window(current_keyframe)
 
+        self.backend.finalize_pending_keyframes()
         self.backend.optimize_full_graph()
 
         edges = self.graph.edges

@@ -17,8 +17,6 @@ import torch
 from lietorch import SE3
 
 from .buffer import DEPTH_STATUS_REFINED, GraphBuffer, KeyframeCandidate
-from .edge_filters import filter_local_edge_measurement
-from .factor_graph import FactorGraph
 from .measurements import GeoNTMeasurements
 
 
@@ -29,27 +27,22 @@ class SLAMFrontend:
         self,
         measurements: GeoNTMeasurements,
         buffer: GraphBuffer,
-        graph: FactorGraph,
         args,
         device: torch.device,
     ):
         self.measurements = measurements
         self.buffer = buffer
-        self.graph = graph
         self.device = device
         self.keyframe_motion_thresh = float(args.get("keyframe_motion_thresh", 2.5))
-        self.depth_bootstrap_neighbors = int(args.get("depth_bootstrap_neighbors", 2))
-        self.local_edge_outlier_trans_conf_thresh = float(args.local_edge_outlier_trans_conf_thresh)
-        self.local_edge_max_rotation_deg = float(args.get("local_edge_max_rotation_deg", 30.0))
-        self.local_edge_max_translation = float(args.get("local_edge_max_translation", 5.0))
+        self.tracking_multiview_neighbors = int(args.get("tracking_multiview_neighbors", 2))
+        assert self.tracking_multiview_neighbors > 0
         self.last_keyframe: int | None = None
         self.tracking_info = {
             "accepted_keyframes": 0,
             "keyframe_motion_rejections": 0,
             "keyframe_motion_thresh": self.keyframe_motion_thresh,
-            "depth_bootstrap_neighbors": self.depth_bootstrap_neighbors,
-            "depth_bootstrap_runs": 0,
-            "depth_bootstrap_edges_added": 0,
+            "tracking_multiview_neighbors": self.tracking_multiview_neighbors,
+            "tracking_multiview_runs": 0,
         }
 
     def _record_keyframe_accepted(self) -> None:
@@ -82,19 +75,12 @@ class SLAMFrontend:
 
     def _update_candidate_depth(self, keyframe_candidate: KeyframeCandidate, refined_depth: torch.Tensor) -> None:
         refined_depth = refined_depth.float()
-        mask = keyframe_candidate.mask[0]
-        if mask.any():
-            source_mean = keyframe_candidate.depth_sens_normed[0].float()[mask].mean().clamp_min(1e-6)
-            refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
-            keyframe_candidate.scale = keyframe_candidate.scale * (source_mean / refined_mean)
         keyframe_candidate.depth = refined_depth[None].to(dtype=keyframe_candidate.depth.dtype)
         keyframe_candidate.depth_status = DEPTH_STATUS_REFINED
 
-    def _prepare_keyframe_bootstrap(self, target_keyframe: int, keyframe_candidate: KeyframeCandidate) -> dict | None:
-        if self.depth_bootstrap_neighbors <= 0 or target_keyframe <= 0:
-            return None
-
-        start = max(0, int(target_keyframe) - self.depth_bootstrap_neighbors)
+    def _run_tracking_multiview(self, target_keyframe: int, keyframe_candidate: KeyframeCandidate) -> dict:
+        assert target_keyframe > 0
+        start = max(0, int(target_keyframe) - self.tracking_multiview_neighbors)
         neighbors = torch.arange(int(target_keyframe) - 1, start - 1, -1, device=self.device, dtype=torch.long)
         motion_tokens = self.measurements.patch_embed_candidate(keyframe_candidate, neighbors)
         ii = torch.full_like(neighbors, int(target_keyframe))
@@ -108,12 +94,10 @@ class SLAMFrontend:
             {
                 "refined_depth": output["refined_depth"],
                 "depth_confidence": output["depth_confidence"],
-                "depth_observability_logits": output["observability_logits"],
-                "depth_observability_rank": 2,
             }
         )
         self._update_candidate_depth(keyframe_candidate, result["refined_depth"])
-        self.tracking_info["depth_bootstrap_runs"] += 1
+        self.tracking_info["tracking_multiview_runs"] += 1
         return result
 
     def _measurement_subset(self, result: dict, mask: torch.Tensor) -> dict:
@@ -126,46 +110,14 @@ class SLAMFrontend:
                 subset[key] = value
         return subset
 
-    def _seed_source_pose_from_measurement(self, result: dict, source: int, target: int) -> None:
+    def _seed_source_pose_from_measurement(self, result: dict, source: int, target: int, scale: float) -> None:
         edge = (result["ii"] == int(source)) & (result["jj"] == int(target))
         assert edge.any()
         edge_idx = int(torch.nonzero(edge, as_tuple=False)[0].item())
         relative_pose = result["relative_pose"][edge_idx].float().clone()
-        relative_pose[:3] = relative_pose[:3] * self.buffer.depths_sens_scale[source, 0].float()
+        relative_pose[:3] = relative_pose[:3] * scale
         source_pose = SE3(relative_pose.view(1, 7)).inv() * SE3(self.buffer.poses[target].float().view(1, 7))
         self.buffer.poses[source] = source_pose.data[0].to(dtype=self.buffer.poses.dtype)
-
-    def _add_bootstrap_edges(
-        self,
-        current_keyframe: int,
-        last_keyframe: int,
-        bootstrap_result: dict | None,
-    ) -> None:
-        if bootstrap_result is None:
-            return
-
-        last_mask = bootstrap_result["jj"] == int(last_keyframe)
-        if last_mask.any():
-            last_result = self._measurement_subset(bootstrap_result, last_mask)
-            added = self.graph.add_measurement_result(last_result)
-            if int(added["n_added"]) == 0:
-                raise RuntimeError(
-                    f"bootstrap edge {current_keyframe}->{last_keyframe} was accepted but not inserted"
-            )
-            self._seed_source_pose_from_measurement(last_result, current_keyframe, last_keyframe)
-            self.tracking_info["depth_bootstrap_edges_added"] += int(added["n_added"])
-
-        other_mask = ~last_mask
-        if other_mask.any():
-            other_result = self._measurement_subset(bootstrap_result, other_mask)
-            other_result = filter_local_edge_measurement(
-                other_result,
-                max_rotation_deg=self.local_edge_max_rotation_deg,
-                max_translation=self.local_edge_max_translation,
-                trans_conf_thresh=self.local_edge_outlier_trans_conf_thresh,
-            )
-            added = self.graph.add_measurement_result(other_result)
-            self.tracking_info["depth_bootstrap_edges_added"] += int(added["n_added"])
 
     def track(self, keyframe_candidate: KeyframeCandidate, *, force: bool = False) -> dict:
         if self.last_keyframe is None:
@@ -187,9 +139,21 @@ class SLAMFrontend:
 
         last_keyframe = self.last_keyframe
         target_keyframe = self.buffer.n_frames
-        bootstrap_result = self._prepare_keyframe_bootstrap(target_keyframe, keyframe_candidate)
+        tracking_result = self._run_tracking_multiview(target_keyframe, keyframe_candidate)
         current_keyframe = self._commit_keyframe(keyframe_candidate)
-        self._add_bootstrap_edges(current_keyframe, last_keyframe, bootstrap_result)
+        last_result = self._measurement_subset(tracking_result, tracking_result["jj"] == int(last_keyframe))
+        
+        # Seed the source keyframe pose from the tracking measurement
+        mask = keyframe_candidate.mask[0]
+        refined_depth = tracking_result["refined_depth"].float()
+        if mask.any():
+            source_mean = keyframe_candidate.depth_sens_normed[0].float()[mask].mean().clamp_min(1e-6)
+            refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
+            scale = keyframe_candidate.scale * (source_mean / refined_mean)
+        else:
+            scale = keyframe_candidate.scale
+        self._seed_source_pose_from_measurement(last_result, current_keyframe, last_keyframe, scale)
+
         return {
             "accepted": True,
             "reason": "keyframe",
