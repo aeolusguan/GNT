@@ -17,19 +17,6 @@ pipeline:
     intrinsics: ???
     visualize: false
     buffer: 512
-    filter_thresh: 2.5
-    warmup: 8
-    frontend_radius: 2
-    frontend_thresh: 16.0
-    max_factors: 256
-    enable_frontend: false
-    initializer_snapshot_path: ""
-    proximity_window: 25
-    proximity_recent: 5
-    proximity_nms: 1
-    proximity_thresh: 16.0
-    frontend_min_edges_per_source: 5
-    seq_init: false
     pgo_iters: 12
     pgo_damping: 1.0e-3
     pgo_lm_max_attempts: 5
@@ -38,5 +25,16 @@ pipeline:
     pgo_mode: se3_scale
     pgo_rotation_only: false
     pgo_backend: cuda_eigen
-    frontend_outlier_trans_conf_thresh: 0.1
+    local_edge_outlier_trans_conf_thresh: 0.1
+    local_edge_max_rotation_deg: 30.0
+    local_edge_max_translation: 5.0
+    keyframe_motion_thresh: 2.5
+    local_mapping_window: 8
+    local_mapping_radius: 2
+    local_mapping_nms: 1
+    local_mapping_thresh: 16.0
+    local_pgo_every: 1
+    local_refine_depth: true
+    depth_bootstrap_neighbors: 2
+    depth_refine_observability_topk: 4
     use_fp16: true

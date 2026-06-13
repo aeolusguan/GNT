@@ -194,15 +194,15 @@ def _edge_error_rows(
     gt_poses: np.ndarray,
     slam_output,
 ) -> list[dict]:
-    finalized_edges = slam_output.finalized_edges or {}
-    if not finalized_edges or finalized_edges["ii"].numel() == 0:
+    pose_edges = slam_output.pose_edges or {}
+    if not pose_edges or pose_edges["ii"].numel() == 0:
         return []
 
-    ii = finalized_edges["ii"].detach().cpu().numpy().astype(np.int64)
-    jj = finalized_edges["jj"].detach().cpu().numpy().astype(np.int64)
-    rel_pose = finalized_edges["relative_pose"].detach().cpu().numpy()
-    edge_scale = finalized_edges["relative_scale"].detach().cpu().numpy()
-    confidence = finalized_edges["confidence"].detach().cpu().numpy()
+    ii = pose_edges["ii"].detach().cpu().numpy().astype(np.int64)
+    jj = pose_edges["jj"].detach().cpu().numpy().astype(np.int64)
+    rel_pose = pose_edges["relative_pose"].detach().cpu().numpy()
+    edge_scale = pose_edges["relative_scale"].detach().cpu().numpy()
+    confidence = pose_edges["confidence"].detach().cpu().numpy()
     if confidence.ndim == 1:
         confidence = np.stack((confidence, confidence), axis=1)
     node_scales = slam_output.scales.detach().cpu().numpy() if slam_output.scales is not None else np.ones(len(keyframe_ids))
@@ -390,7 +390,7 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
             "frames": int(len(stream)),
             "first_frame": int(cfg.frame_start),
             "frame_skip": int(cfg.frame_skip),
-            "edge_count": int((slam_output.finalized_edges or {}).get("ii", torch.empty(0)).numel()),
+            "edge_count": int((slam_output.pose_edges or {}).get("ii", torch.empty(0)).numel()),
             "pgo_success": bool(pgo_info.get("success", False)),
             "pgo_mode": str(pgo_info.get("mode", "")),
             "pgo_backend": str(pgo_info.get("backend", "")),

@@ -43,7 +43,9 @@ class SLAMOutput:
     log_scales: torch.Tensor | None = None
     depths: torch.Tensor | None = None  # (N, 1, H, W), keyframe-aligned
     depth_masks: torch.Tensor | None = None  # (N, 1, H, W), keyframe-aligned
-    finalized_edges: dict[str, torch.Tensor] | None = None
+    depth_status: torch.Tensor | None = None  # 0 empty, 1 mono, 2 refined
+    depth_dirty: torch.Tensor | None = None  # keyframe-aligned dirty depth flags
+    pose_edges: dict[str, torch.Tensor] | None = None
     pgo_info: dict | None = None
     pgo_replay: dict[str, torch.Tensor] | None = None
     slam_map: SLAMMap | None = None

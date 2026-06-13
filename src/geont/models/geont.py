@@ -99,6 +99,7 @@ class GeoNT(nn.Module):
         intrinsics: torch.Tensor,
         export_feat_layers: list[int] | None = None,
         use_fp16: bool = False,
+        camera_prior: torch.Tensor | None = None,
     ):
         if export_feat_layers is None:
             export_feat_layers = []
@@ -123,8 +124,16 @@ class GeoNT(nn.Module):
         patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,H,W,C]
 
         # multi-view transformer aggregation
+        backbone_kwargs = {}
+        if camera_prior is not None:
+            assert camera_prior.shape == (motion_token.shape[0], 1, self.embed_dim)
+            backbone_kwargs["cam_token"] = camera_prior
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
-            feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
+            feats, aux_feats = self.backbone(
+                patch_token,
+                export_feat_layers=export_feat_layers,
+                **backbone_kwargs,
+            )
 
         res_feat = self.res_depth_embed(depthmap)
         ht, wd = depth.shape[-2:]
@@ -151,6 +160,7 @@ class GeoNT(nn.Module):
         export_feat_layers: list[int] | None = None,
         use_fp16: bool = False,
         decode_depth: bool = True,
+        camera_prior: torch.Tensor | None = None,
     ):
         """Run GeoNT from precomputed per-edge motion tokens.
 
@@ -169,8 +179,16 @@ class GeoNT(nn.Module):
 
         patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]
 
+        backbone_kwargs = {}
+        if camera_prior is not None:
+            assert camera_prior.shape == (motion_token.shape[0], 1, self.embed_dim)
+            backbone_kwargs["cam_token"] = camera_prior
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
-            feats, aux_feats = self.backbone(patch_token, export_feat_layers=export_feat_layers)
+            feats, aux_feats = self.backbone(
+                patch_token,
+                export_feat_layers=export_feat_layers,
+                **backbone_kwargs,
+            )
 
         ht, wd = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
@@ -462,6 +480,7 @@ class GeoNTWrapper(nn.Module):
         intrinsics: torch.Tensor,
         use_fp16: bool = False,
         decode_depth: bool = True,
+        camera_prior: torch.Tensor | None = None,
     ):
         return self.gnt.forward_from_motion_tokens(
             motion_token,
@@ -470,4 +489,5 @@ class GeoNTWrapper(nn.Module):
             export_feat_layers=[],
             use_fp16=use_fp16,
             decode_depth=decode_depth,
+            camera_prior=camera_prior,
         )

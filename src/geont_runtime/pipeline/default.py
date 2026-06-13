@@ -73,10 +73,10 @@ class DefaultAnnotationPipeline(Pipeline):
             log_scales = slam_output.log_scales.cpu().numpy()
         scales = np.exp(log_scales).astype(np.float32) if log_scales.size else np.array([], dtype=np.float32)
         pgo_info = slam_output.pgo_info or {}
-        finalized_edges = slam_output.finalized_edges or {}
-        finalized_np = {
+        pose_edges = slam_output.pose_edges or {}
+        edge_np = {
             f"edge_{key}": value.cpu().numpy()
-            for key, value in finalized_edges.items()
+            for key, value in pose_edges.items()
         }
         replay_np = pgo_replay_npz_payload(slam_output.pgo_replay)
 
@@ -88,7 +88,7 @@ class DefaultAnnotationPipeline(Pipeline):
             log_scales=log_scales,
             scales=scales,
             pgo_info=np.array(json.dumps(pgo_info)),
-            **finalized_np,
+            **edge_np,
             **replay_np,
         )
 
@@ -100,6 +100,10 @@ class DefaultAnnotationPipeline(Pipeline):
             }
             if slam_output.depth_masks is not None:
                 depth_payload["masks"] = slam_output.depth_masks.cpu().numpy()
+            if slam_output.depth_status is not None:
+                depth_payload["depth_status"] = slam_output.depth_status.cpu().numpy()
+            if slam_output.depth_dirty is not None:
+                depth_payload["depth_dirty"] = slam_output.depth_dirty.cpu().numpy()
             np.savez_compressed(artifact_path.depth_npz_path, **depth_payload)
     
     def run(self, video_data: VideoStream) -> AnnotationPipelineOutput:

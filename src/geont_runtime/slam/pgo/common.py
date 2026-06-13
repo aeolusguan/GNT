@@ -194,7 +194,7 @@ def _initial_from_edges(
     log_s: torch.Tensor,
     edge_conf: torch.Tensor,
 ):
-    """Build initial poses from finalized edges.
+    """Build initial poses from pose graph edges.
 
     ii/jj: (E,), rel_edges.poses.data: (E, 7), log_s: (N,), edge_conf: (E, 2).
     Returns poses.data (N, 7) and visited (N,).

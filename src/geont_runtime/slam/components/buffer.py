@@ -18,7 +18,26 @@
 # Licensed under the MIT License. See THIRD_PARTY_LICENSES.md for details.
 # -------------------------------------------------------------------------------------------------
 
+from dataclasses import dataclass
+
 import torch
+
+
+DEPTH_STATUS_MONO = 1
+DEPTH_STATUS_REFINED = 2
+
+
+@dataclass(kw_only=True)
+class KeyframeCandidate:
+    frame_idx: int
+    fmap: torch.Tensor
+    depth: torch.Tensor
+    depth_sens_normed: torch.Tensor
+    scale: torch.Tensor
+    mask: torch.Tensor
+    bases: torch.Tensor
+    intrinsics: torch.Tensor
+    depth_status: int = DEPTH_STATUS_MONO
 
 
 class GraphBuffer:
@@ -41,10 +60,11 @@ class GraphBuffer:
         # timestamp (frame index)
         self.tstamp = torch.zeros(buffer_size, device=device, dtype=torch.int)
         self.dirty = torch.zeros(buffer_size, device=device, dtype=torch.bool)
+        self.depth_status = torch.zeros(buffer_size, device=device, dtype=torch.uint8)
+        self.depth_dirty = torch.zeros(buffer_size, device=device, dtype=torch.bool)
         # Camera pose for each keyframe.
         self.poses = torch.zeros(buffer_size, 7, device=device, dtype=torch.float)
         self.poses[:] = torch.as_tensor([0, 0, 0, 0, 0, 0, 1], dtype=torch.float, device=self.poses.device)
-        self.marginalized = torch.zeros(buffer_size, device=device, dtype=torch.bool)
         # This will be the original intrinsics
         self.intrinsics = torch.zeros(
             self.n_views,

@@ -115,7 +115,7 @@ outputs/depth/<sequence_name>.npz
 ```
 
 The pose artifact contains keyframe trajectory, timestamps, intrinsics,
-optimized scales, finalized pose-graph edges, and PGO diagnostics. The depth
+optimized scales, immediate pose-graph edges, and PGO diagnostics. The depth
 artifact contains keyframe-aligned depth maps, masks, and timestamps.
 
 See `docs/streaming_inference.md` for the detailed artifact schema and pose

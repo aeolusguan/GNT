@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import uuid
-from pathlib import Path
 
 import numpy as np
 import rerun as rr
@@ -27,11 +26,11 @@ from geont_runtime.streams.base import FrameAttribute, ProcessedVideoStream, Str
 from geont_runtime.utils.logging import pbar
 from geont.models import GeoNTWrapper
 
-from .components.buffer import GraphBuffer
+from .components.buffer import GraphBuffer, KeyframeCandidate
+from .components.backend import SLAMBackend
+from .components.factor_graph import FactorGraph
 from .components.frontend import SLAMFrontend
-from .components.initializer import OnePassInitializer
-from .components.motion_filter import MotionFilter
-from .frontend_snapshot import save_initializer_snapshot
+from .components.measurements import GeoNTMeasurements
 from .interface import SLAMOutput
 
 
@@ -105,65 +104,118 @@ class SLAMSystem:
             buffer_size=self.config.buffer,
             device=self.device
         )
-        self.motion_filter = MotionFilter(
-            self.gnt,
-            thresh=self.config.filter_thresh,
-            device=self.device,
-        )
-        self.initializer = OnePassInitializer(
+        self.measurements = GeoNTMeasurements(
             self.gnt,
             self.buffer,
+            self.device,
+            use_fp16=self.config.use_fp16,
+        )
+        self.graph = FactorGraph(self.buffer, self.device)
+        self.frontend = SLAMFrontend(
+            self.measurements,
+            self.buffer,
+            self.graph,
             self.config,
             device=self.device,
         )
-        self.frontend = SLAMFrontend(
-            self.gnt,
+        self.backend = SLAMBackend(
+            self.measurements,
             self.buffer,
+            self.graph,
             self.config,
             device=self.device,
         )
 
-    def _add_keyframe(
+    def _make_keyframe_candidate(
         self,
         frame_idx: int,
         images: torch.Tensor,
         intrinsics: torch.Tensor,
-        phase: int,
-        features: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
-        bases: torch.Tensor | None = None,
-    ):
-        assert phase in [1, 2]
-        kf_idx = self.buffer.n_frames
-        if kf_idx >= self.buffer.poses.shape[0]:
-            raise RuntimeError(
-                f"SLAM buffer is full at {kf_idx} keyframes; increase slam.buffer in the config."
-            )
-        self.buffer.tstamp[kf_idx] = frame_idx
-        if features is None:
-            gmap, mono_depth, non_sky_mask = self.gnt.encode_features(images, intrinsics)
-        else:
-            gmap, mono_depth, non_sky_mask = features
-        self.buffer.fmaps[kf_idx] = gmap
+    ) -> KeyframeCandidate:
+        gmap, mono_depth, non_sky_mask = self.gnt.encode_features(images, intrinsics)
         normed_depth, scale = self.gnt.normalize_depth(mono_depth, non_sky_mask)
-        if bases is None:
-            bases = self.gnt.encode_bases(mono_depth, non_sky_mask)
-        depth_prior = normed_depth.float()
-        self.buffer.depths[kf_idx] = depth_prior.to(dtype=self.buffer.depths.dtype)
-        self.buffer.depths_sens_normed[kf_idx] = normed_depth
-        self.buffer.depths_sens_scale[kf_idx] = scale
-        self.buffer.non_sky_masks[kf_idx] = non_sky_mask
-        self.buffer.bases[kf_idx] = bases
+        bases = self.gnt.encode_bases(mono_depth, non_sky_mask)
+        return KeyframeCandidate(
+            frame_idx=int(frame_idx),
+            fmap=gmap,
+            depth=normed_depth,
+            depth_sens_normed=normed_depth,
+            scale=scale,
+            mask=non_sky_mask,
+            bases=bases,
+            intrinsics=intrinsics,
+        )
 
-        if kf_idx == 0:
-            self.buffer.intrinsics[0] = intrinsics[0]
-            
-        self.buffer.n_frames += 1
-        
     def _precompute_features(self, frame_data: VideoFrame):
         assert frame_data.intrinsics is not None
         images = rearrange(frame_data.rgb[None], "n h w c -> n c h w")
         intrinsics = frame_data.intrinsics[None]
         return images.to(self.device), intrinsics.to(self.device)
+
+    def _make_output(self, resizer: StandardResizeStreamProcessor, edges) -> SLAMOutput:
+        n_frames = self.buffer.n_frames
+        original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics[0])
+        return SLAMOutput(
+            trajectory=SE3(self.buffer.poses[:n_frames]),
+            intrinsics=original_intrinsics,
+            log_scales=torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6)),
+            depths=self.buffer.depths[:n_frames],
+            depth_masks=self.buffer.non_sky_masks[:n_frames],
+            depth_status=self.buffer.depth_status[:n_frames].clone(),
+            depth_dirty=self.buffer.depth_dirty[:n_frames].clone(),
+            pose_edges={
+                "ii": edges.ii,
+                "jj": edges.jj,
+                "relative_pose": edges.relative_pose,
+                "relative_scale": edges.relative_scale,
+                "confidence": edges.confidence,
+                "depth_observability_score": edges.depth_observability_score,
+                "depth_observability_rank": edges.depth_observability_rank,
+            },
+            pgo_info=dict(edges.pgo_info),
+            pgo_replay=dict(edges.pgo_replay),
+            slam_map=None,
+            timestamps=self.buffer.tstamp[:n_frames].cpu().numpy(),
+        )
+
+    def _run_streaming_local_mapping(
+        self,
+        video_stream: VideoStream,
+        resizer: StandardResizeStreamProcessor,
+        total_n_frames: int,
+    ) -> SLAMOutput:
+        frame_data: VideoFrame
+        for frame_idx, frame_data in pbar(
+            enumerate(video_stream), desc="GeoNT local mapping", total=total_n_frames
+        ):
+            images, intrinsics = self._precompute_features(frame_data)
+            keyframe_candidate = self._make_keyframe_candidate(frame_idx, images, intrinsics)
+            tracking = self.frontend.track(
+                keyframe_candidate,
+                force=frame_idx == total_n_frames - 1,
+            )
+            if not tracking["accepted"]:
+                continue
+
+            current_keyframe = int(tracking["keyframe"])
+            if current_keyframe == 0:
+                continue
+
+            changed_sources = [
+                self.backend.update_local_graph(current_keyframe),
+            ]
+            changed_sources = [sources for sources in changed_sources if sources.numel() > 0]
+            if changed_sources:
+                self.backend.refine_changed_sources(torch.unique(torch.cat(changed_sources)), current_keyframe)
+            self.backend.optimize_local_window(current_keyframe)
+
+        self.backend.optimize_full_graph()
+
+        edges = self.graph.edges
+        edges.pgo_info.update(self.frontend.tracking_info)
+        edges.pgo_info.update(self.backend.backend_info)
+        edges.pgo_info.update(self.backend.local_edge_outlier_info)
+        return self._make_output(resizer, edges)
 
     @torch.no_grad()
     def run(
@@ -184,7 +236,6 @@ class SLAMSystem:
                 "height": frame_size[0],
                 "width": frame_size[1],
                 "n_views": 1,
-                "has_init_pose": FrameAttribute.POSE in video_stream.attributes(),
             }
         )
 
@@ -194,66 +245,8 @@ class SLAMSystem:
             rr.init("ViPE Visualization", spawn=True, recording_id=uuid.uuid4())
             rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
 
-        frame_data: VideoFrame
-        for frame_idx, frame_data in pbar(
-            enumerate(video_stream), desc="SLAM Initialization", total=total_n_frames
-        ):
-            images, intrinsics = self._precompute_features(frame_data)
-
-            should_add_keyframe = self.motion_filter.check(
-                images,
-                intrinsics,
-                force=frame_idx == total_n_frames - 1,
-            )
-            if should_add_keyframe:
-                self._add_keyframe(
-                    frame_idx,
-                    images,
-                    intrinsics,
-                    phase=1,
-                    features=(
-                        self.motion_filter.f_fmap,
-                        self.motion_filter.f_mono,
-                        self.motion_filter.f_non_sky_mask,
-                    ),
-                    bases=self.motion_filter.f_bases,
-                )
-                self.initializer.run()
-
-        self.initializer.finalize()
-        initializer_snapshot_path = str(self.config.initializer_snapshot_path)
-        if initializer_snapshot_path:
-            save_initializer_snapshot(
-                Path(initializer_snapshot_path),
-                self.buffer,
-                self.initializer.edges,
-                metadata={
-                    "ckpt_path": str(self.config.ckpt_path),
-                    "pgo_mode": str(self.config.pgo_mode),
-                    "pgo_backend": str(self.config.pgo_backend),
-                },
-            )
-        edges = self.initializer.edges
-        if self.config.enable_frontend:
-            self.frontend.run(self.initializer.edges)
-            edges = self.frontend.graph.edges
-
-        original_intrinsics = resizer.recover_intrinsics(self.buffer.intrinsics[0])
-        return SLAMOutput(
-            trajectory=SE3(self.buffer.poses[: self.buffer.n_frames]),
-            intrinsics=original_intrinsics,
-            log_scales=torch.log(self.buffer.depths_sens_scale[: self.buffer.n_frames, 0].clamp_min(1e-6)),
-            depths=self.buffer.depths[: self.buffer.n_frames],
-            depth_masks=self.buffer.non_sky_masks[: self.buffer.n_frames],
-            finalized_edges={
-                "ii": edges.ii,
-                "jj": edges.jj,
-                "relative_pose": edges.relative_pose,
-                "relative_scale": edges.relative_scale,
-                "confidence": edges.confidence,
-            },
-            pgo_info=dict(edges.pgo_info),
-            pgo_replay=dict(edges.pgo_replay),
-            slam_map=None,
-            timestamps=self.buffer.tstamp[: self.buffer.n_frames].cpu().numpy(),
+        return self._run_streaming_local_mapping(
+            video_stream,
+            resizer,
+            total_n_frames,
         )

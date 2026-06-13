@@ -23,46 +23,11 @@ import warnings
 import torch
 from lietorch import SE3
 
-from geont.geometry.projective_ops import induced_flow
-from geont.models import GeoNTWrapper
 from .buffer import GraphBuffer
 from geont_runtime.slam.pgo import DEFAULT_LM_MAX_ATTEMPTS, optimize_sim3_pose_graph
 from geont_runtime.slam.pgo.replay import make_pgo_replay_graph
 
-# Disable all future warnings (mainly torch.cuda.amp related)
 warnings.simplefilter(action="ignore", category=FutureWarning)
-
-
-def _frontend_outlier_info(trans_conf_thresh: float) -> dict:
-    return {
-        "frontend_outlier_trans_conf_thresh": float(trans_conf_thresh),
-        "frontend_outlier_candidates": 0,
-        "frontend_outlier_accepted": 0,
-        "frontend_outlier_dropped": 0,
-        "frontend_outlier_duplicate_filtered_after_gate": 0,
-    }
-
-
-def _filter_frontend_edges_by_confidence(
-    ii: torch.Tensor,
-    jj: torch.Tensor,
-    pose: torch.Tensor,
-    scale: torch.Tensor,
-    confidence: torch.Tensor,
-    trans_conf_thresh: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    info = _frontend_outlier_info(trans_conf_thresh)
-    info["frontend_outlier_candidates"] = int(ii.numel())
-    if ii.numel() == 0:
-        return ii, jj, pose, scale, confidence, info
-
-    trans_conf = confidence[:, 0]
-    keep = trans_conf >= float(trans_conf_thresh)
-    counts = torch.stack((keep.sum(), (~keep).sum())).cpu().tolist()
-    info["frontend_outlier_accepted"] = int(counts[0])
-    info["frontend_outlier_dropped"] = int(counts[1])
-
-    return ii[keep], jj[keep], pose[keep], scale[keep], confidence[keep], info
 
 
 class PoseGraphEdges:
@@ -72,6 +37,8 @@ class PoseGraphEdges:
         self.relative_pose = torch.zeros([0, 7], device=device, dtype=torch.float)
         self.relative_scale = torch.zeros([0], device=device, dtype=torch.float)
         self.confidence = torch.zeros([0, 2], device=device, dtype=torch.float)
+        self.depth_observability_score = torch.zeros([0], device=device, dtype=torch.float)
+        self.depth_observability_rank = torch.zeros([0], device=device, dtype=torch.uint8)
         self.pgo_info = {}
         self.pgo_replay = {}
         self._edge_set: set[tuple[int, int]] = set()
@@ -90,328 +57,183 @@ class PoseGraphEdges:
         pose: torch.Tensor,
         scale: torch.Tensor,
         confidence: torch.Tensor,
-    ) -> int:
-        existing = self._sync_edge_set()
-        ii_cpu = ii.cpu().tolist()
-        jj_cpu = jj.cpu().tolist()
+        observability_score: torch.Tensor,
+        observability_rank: torch.Tensor,
+    ) -> torch.Tensor:
+        assert ii.shape == jj.shape
+        assert observability_score.shape == ii.shape
+        assert observability_rank.shape == ii.shape
+        assert (observability_rank > 0).all()
+        assert torch.isfinite(observability_score).all()
+        existing = set(self._sync_edge_set())
         keep = []
-        for idx, (i, j) in enumerate(zip(ii_cpu, jj_cpu)):
+        for idx, (i, j) in enumerate(zip(ii.cpu().tolist(), jj.cpu().tolist())):
             directed_pair = (int(i), int(j))
-            if directed_pair not in existing:
-                keep.append(idx)
+            if directed_pair in existing:
+                continue
+            keep.append(idx)
+            existing.add(directed_pair)
         if not keep:
-            return 0
-        keep = torch.as_tensor(keep, device=ii.device, dtype=torch.long)
-        self.ii = torch.cat((self.ii, ii[keep].long()), dim=0)
-        self.jj = torch.cat((self.jj, jj[keep].long()), dim=0)
-        self.relative_pose = torch.cat((self.relative_pose, pose[keep].float()), dim=0)
-        self.relative_scale = torch.cat((self.relative_scale, scale[keep].float()), dim=0)
-        self.confidence = torch.cat((self.confidence, confidence[keep].float()), dim=0)
-        self._edge_set.update(
-            (int(i), int(j)) for i, j in zip(ii[keep].cpu().tolist(), jj[keep].cpu().tolist())
+            return torch.zeros(ii.shape[0], device=ii.device, dtype=torch.bool)
+
+        keep_idx = torch.as_tensor(keep, device=ii.device, dtype=torch.long)
+        keep_mask = torch.zeros(ii.shape[0], device=ii.device, dtype=torch.bool)
+        keep_mask[keep_idx] = True
+        self.ii = torch.cat((self.ii, ii[keep_idx].long()), dim=0)
+        self.jj = torch.cat((self.jj, jj[keep_idx].long()), dim=0)
+        self.relative_pose = torch.cat((self.relative_pose, pose[keep_idx].float()), dim=0)
+        self.relative_scale = torch.cat((self.relative_scale, scale[keep_idx].float()), dim=0)
+        self.confidence = torch.cat((self.confidence, confidence[keep_idx].float()), dim=0)
+        self.depth_observability_score = torch.cat(
+            (self.depth_observability_score, observability_score[keep_idx].float()),
+            dim=0,
         )
-        return int(keep.numel())
+        self.depth_observability_rank = torch.cat(
+            (self.depth_observability_rank, observability_rank[keep_idx].to(dtype=torch.uint8)),
+            dim=0,
+        )
+        self._edge_set = existing
+        return keep_mask
 
     def add_from(self, other) -> int:
-        added = self.add(other.ii, other.jj, other.relative_pose, other.relative_scale, other.confidence)
+        keep = self.add(
+            other.ii,
+            other.jj,
+            other.relative_pose,
+            other.relative_scale,
+            other.confidence,
+            other.depth_observability_score,
+            other.depth_observability_rank,
+        )
         self.pgo_info = dict(other.pgo_info)
         self.pgo_replay = dict(other.pgo_replay)
-        return added
+        return int(keep.sum().item())
 
-
-class InitializationFactorGraph:
-    @staticmethod
-    def coords_grid(ht, wd, **kwargs):
-        y, x = torch.meshgrid(
-            torch.arange(ht).to(**kwargs).float(),
-            torch.arange(wd).to(**kwargs).float(),
-            indexing="ij",
+    def update_depth_observability(
+        self,
+        ii: torch.Tensor,
+        jj: torch.Tensor,
+        observability_logits: torch.Tensor,
+        *,
+        rank: int,
+    ) -> None:
+        assert ii.numel() == jj.numel()
+        assert observability_logits.shape[0] == int(ii.numel())
+        scores = observability_logits.float().flatten(1).mean(dim=1).to(device=self.depth_observability_score.device)
+        assert torch.isfinite(scores).all()
+        edge_to_index = {
+            (int(i), int(j)): idx
+            for idx, (i, j) in enumerate(zip(self.ii.cpu().tolist(), self.jj.cpu().tolist()))
+        }
+        edge_indices = torch.as_tensor(
+            [edge_to_index[(int(i), int(j))] for i, j in zip(ii.cpu().tolist(), jj.cpu().tolist())],
+            dtype=torch.long,
+            device=self.depth_observability_score.device,
         )
-        return torch.stack([x, y], dim=-1)
-    
+        if int(rank) == 1:
+            update = self.depth_observability_rank[edge_indices] == 0
+            edge_indices = edge_indices[update]
+            scores = scores[update]
+        if edge_indices.numel() == 0:
+            return
+        self.depth_observability_score[edge_indices] = scores
+        self.depth_observability_rank[edge_indices] = int(rank)
+
+    def select_depth_observability_topk(
+        self,
+        source: int,
+        neighbors: torch.Tensor,
+        topk: int | None,
+    ) -> torch.Tensor:
+        if topk is None or int(topk) >= int(neighbors.numel()):
+            return neighbors
+
+        edge_to_index = {(int(i), int(j)): idx for idx, (i, j) in enumerate(zip(self.ii.cpu().tolist(), self.jj.cpu().tolist()))}
+        edge_indices = torch.as_tensor(
+            [edge_to_index[(int(source), int(neighbor))] for neighbor in neighbors.cpu().tolist()],
+            dtype=torch.long,
+            device=neighbors.device,
+        )
+        ranks = self.depth_observability_rank[edge_indices]
+        if (ranks == 0).any():
+            missing = neighbors[ranks == 0].cpu().tolist()
+            raise RuntimeError(f"missing depth observability cache for directed edges from {source}: {missing[:8]}")
+
+        score_tensor = self.depth_observability_score[edge_indices].to(device=neighbors.device)
+        topk_indices = torch.topk(score_tensor, min(int(topk), int(neighbors.numel())), dim=0).indices
+        return neighbors[topk_indices]
+
+
+class FactorGraph:
     def __init__(
         self,
-        net: GeoNTWrapper,
         buffer: GraphBuffer,
         device: torch.device,
     ):
-        self.net = net
         self.buffer = buffer
         self.device = device
-
-        # edge connection are the same for all the views.
-        self.ii = torch.as_tensor([], dtype=torch.long, device=device)
-        self.jj = torch.as_tensor([], dtype=torch.long, device=device)
-
-    @torch.no_grad()
-    def patch_embed(self, ii, jj):
-        fmap1 = self.buffer.fmaps[ii, 0].float()
-        fmap2 = self.buffer.fmaps[jj, 0].float()
-        bases = self.buffer.bases[ii, 0].float()
-        intrinsics = self.buffer.intrinsics[0:1].expand(fmap1.shape[0], -1)
-        with torch.amp.autocast(device_type=self.device.type, enabled=False):
-            return self.net.encode_flow(fmap1, fmap2, bases, intrinsics)
-
-    def frame_distance(self, ii, jj):
-        fmap1 = self.buffer.fmaps[ii, 0].float()
-        fmap2 = self.buffer.fmaps[jj, 0].float()
-        bases = self.buffer.bases[ii, 0].float()
-        with torch.amp.autocast(device_type=self.device.type, enabled=False):
-            flow, _ = self.net.flow_init(fmap1, fmap2, bases)
-        return flow.norm(dim=1).mean(dim=(1, 2))
-
-    def projection_distance(self, ii, jj, stride: int = 8, chunk_size: int = 1024):
-        n_frames = self.buffer.n_frames
-        poses = SE3(self.buffer.poses[:n_frames].float())[None]
-        depth = self.buffer.depths[:n_frames, 0].float()
-        scale = self.buffer.depths_sens_scale[:n_frames, 0].float()
-        metric_depth = depth * scale[:, None, None]
-        disps = 1.0 / metric_depth.clamp_min(1e-6)
-        disps = disps[:, stride // 2 - 1 :: stride, stride // 2 - 1 :: stride][None]
-        source_masks = self.buffer.non_sky_masks[:n_frames, 0]
-        source_masks = source_masks[:, stride // 2 - 1 :: stride, stride // 2 - 1 :: stride][None]
-        intrinsics = (self.buffer.intrinsics[0] / float(stride)).expand(n_frames, -1)[None]
-
-        distances = []
-        for start in range(0, ii.numel(), chunk_size):
-            end = min(start + chunk_size, ii.numel())
-            flow, valid = induced_flow(poses, disps, intrinsics, ii[start:end], jj[start:end])
-            flow_mag = flow.norm(dim=-1).clamp(max=256.0)
-            source_mask = source_masks[:, ii[start:end]].float()
-            valid = valid.squeeze(-1) * source_mask
-            valid_count = valid.sum(dim=(-1, -2))
-            source_count = source_mask.sum(dim=(-1, -2))
-            distance = (flow_mag * valid).sum(dim=(-1, -2)) / valid_count.clamp_min(1.0)
-            valid_ratio = valid_count / source_count.clamp_min(1.0)
-            distance = torch.where(valid_ratio > 0.5, distance, torch.full_like(distance, torch.inf))
-            distances.append(distance.squeeze(0))
-        return torch.cat(distances, dim=0)
-
-    def _filter_repeated_edges(self, ii, jj):
-        """remove duplicate edges"""
-
-        eset = {(int(i), int(j)) for i, j in zip(self.ii.cpu().tolist(), self.jj.cpu().tolist())}
-        ii_cpu = ii.cpu().tolist()
-        jj_cpu = jj.cpu().tolist()
-
-        keep = [(int(i), int(j)) not in eset for i, j in zip(ii_cpu, jj_cpu)]
-        keep = torch.as_tensor(keep, dtype=torch.bool, device=ii.device)
-
-        return ii[keep], jj[keep]
-
-    def add_factors(self, ii, jj):
-        """add edges to factor graph"""
-
-        ii, jj = self._filter_repeated_edges(ii, jj)
-        if ii.numel() == 0:
-            return
-
-        self.ii = torch.cat([self.ii, ii], 0)
-        self.jj = torch.cat([self.jj, jj], 0)
-
-    def rm_factors(self, mask: torch.Tensor):
-        """drop edges from factor graph"""
-
-        self.ii = self.ii[~mask]
-        self.jj = self.jj[~mask]
-
-    def add_neighborhood_factors(
-        self,
-        t0: int,
-        t1: int,
-        r: int = 3,
-        thresh: float = 16.0,
-    ):
-        ii, jj = torch.meshgrid(
-            torch.arange(t0, t1, device=self.device),
-            torch.arange(t0, t1, device=self.device),
-            indexing="ij",
-        )
-        ii = ii.reshape(-1).long()
-        jj = jj.reshape(-1).long()
-
-        keep = ((ii - jj).abs() > 0) & ((ii - jj).abs() <= r)
-        ii, jj = ii[keep], jj[keep]
-        ii, jj = self._filter_repeated_edges(ii, jj)
-        if ii.numel() == 0:
-            return
-
-        flow = self.frame_distance(ii, jj)
-        keep = flow <= float(thresh)
-        latest = t1 - 1
-        latest_edges = (ii == latest) | (jj == latest)
-        if not (keep & latest_edges).any():
-            latest_edges = torch.nonzero(latest_edges, as_tuple=False).flatten()
-            assert latest_edges.numel() > 0
-            latest_dist = (ii[latest_edges] - jj[latest_edges]).abs()
-            keep[latest_edges[torch.argmin(latest_dist)]] = True
-        self.add_factors(ii[keep], jj[keep])
-
-    def active_edge_count(self) -> int:
-        return int(self.ii.numel())
-
-    def active_keyframe_count(self) -> int:
-        if self.ii.numel() == 0:
-            return 0
-        keyframes = torch.unique(self.ii)
-        return int(keyframes.numel())
-
-    def oldest_keyframe(self) -> int | None:
-        if self.ii.numel() == 0:
-            return None
-        return int(self.ii.min().item())
-
-    def _incident_neighbors(self, keyframe: int) -> torch.Tensor:
-        neighbors = self.jj[self.ii == keyframe]
-        return neighbors
-
-    def _motion_tokens_from_keyframe(self, keyframe: int, neighbors: torch.Tensor) -> torch.Tensor:
-        ii = torch.full_like(neighbors, keyframe)
-        return self.patch_embed(ii, neighbors)
-
-    def _canonicalize_edge_conf(self, conf: torch.Tensor, n_edges: int) -> torch.Tensor:
-        """Return edge confidence as (E, 2)."""
-        assert conf.shape[0] == n_edges
-
-        edge_conf = 1 - 1 / conf
-        edge_conf[:, 1] = 1.0
-        return edge_conf
-
-    @torch.no_grad()
-    def marginalize_keyframe(
-        self,
-        keyframe: int,
-        use_fp16: bool = False,
-        decode_depth: bool = True,
-    ) -> dict | None:
-        neighbors = self._incident_neighbors(keyframe)
-        if neighbors.numel() == 0:
-            return None
-
-        motion_tokens = self._motion_tokens_from_keyframe(keyframe, neighbors)
-        depth = self.buffer.depths_sens_normed[keyframe, 0].float()
-        mask = self.buffer.non_sky_masks[keyframe, 0]
-        intrinsics = self.buffer.intrinsics[0]
-
-        output = self.net.refine_from_motion_tokens(
-            motion_tokens,
-            depth,
-            mask,
-            intrinsics,
-            use_fp16=use_fp16,
-            decode_depth=decode_depth,
-        )
-
-        edge_scale = self.buffer.depths_sens_scale[keyframe, 0]
-        result = {}
-        if decode_depth:
-            refined_depth = output["depth"].float()
-            result["refined_depth"] = refined_depth
-            result["source_scale"] = edge_scale
-        if decode_depth and mask.any():
-            moge_mean = depth[mask].mean()
-            refined_mean = refined_depth[mask].mean()
-            edge_scale = edge_scale * moge_mean / refined_mean
-            result["source_scale"] = edge_scale
-        edge_scales = edge_scale.expand(neighbors.shape[0])
-
-        ii = torch.full_like(neighbors, keyframe)
-        pose = output["pose_enc"].float()
-        pose[:, 3:7] = pose[:, 3:7] / pose[:, 3:7].norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        conf = output["pose_confidence"].float()
-        conf = self._canonicalize_edge_conf(conf, int(ii.numel()))
-
-        self.rm_factors(self.ii == keyframe)
-
-        result.update(
-            {
-                "ii": ii,
-                "jj": neighbors,
-                "relative_pose": pose,
-                "relative_scale": edge_scales,
-                "confidence": conf,
-            }
-        )
-        return result
-
-
-class FactorGraph(InitializationFactorGraph):
-    def __init__(
-        self,
-        net: GeoNTWrapper,
-        buffer: GraphBuffer,
-        device: torch.device,
-        max_factors: int,
-        frontend_outlier_trans_conf_thresh: float,
-    ):
-        super().__init__(net, buffer, device)
-        self.max_factors = max_factors
-        self.frontend_outlier_trans_conf_thresh = float(frontend_outlier_trans_conf_thresh)
-        self.frontend_outlier_info = _frontend_outlier_info(self.frontend_outlier_trans_conf_thresh)
         self.edges = PoseGraphEdges(device)
 
-        ht = buffer.height // 16
-        wd = buffer.width // 16
-        motion_dim = self.net.gnt.motion_patch_embed.motion_embed.embed_dim
-        self.embed = torch.zeros([0, ht, wd, motion_dim], device=device, dtype=torch.float)
-        self._active_edge_set: set[tuple[int, int]] = set()
-
-    def _frontend_outlier_public_info(self) -> dict:
-        return dict(self.frontend_outlier_info)
-
-    def _update_frontend_outlier_info(self, info: dict, duplicate_filtered_after_gate: int):
-        for key, value in info.items():
-            if key in self.frontend_outlier_info and isinstance(value, int):
-                self.frontend_outlier_info[key] += int(value)
-            else:
-                self.frontend_outlier_info[key] = value
-        self.frontend_outlier_info["frontend_outlier_duplicate_filtered_after_gate"] += int(
-            duplicate_filtered_after_gate
-        )
-        self.edges.pgo_info.update(self._frontend_outlier_public_info())
-
-    def _sync_active_edge_set(self) -> set[tuple[int, int]]:
-        if len(self._active_edge_set) != int(self.ii.numel()):
-            self._active_edge_set = {
-                (int(i), int(j)) for i, j in zip(self.ii.cpu().tolist(), self.jj.cpu().tolist())
-            }
-        return self._active_edge_set
-
-    def add_factors(self, ii, jj):
-        """add edges to factor graph"""
-
-        ii, jj = self._filter_new_edges(ii, jj)
+    def projection_distance(self, ii: torch.Tensor, jj: torch.Tensor, stride: int = 8) -> torch.Tensor:
         if ii.numel() == 0:
-            return
+            return torch.empty_like(ii, dtype=torch.float)
 
-        embed = self.patch_embed(ii, jj)
-        self.ii = torch.cat([self.ii, ii], 0)
-        self.jj = torch.cat([self.jj, jj], 0)
-        self.embed = torch.cat([self.embed, embed], 0)
-        self._active_edge_set.update(
-            (int(i), int(j)) for i, j in zip(ii.cpu().tolist(), jj.cpu().tolist())
+        from . import geom_cuda
+
+        n_frames = self.buffer.n_frames
+        return geom_cuda.projection_distance(
+            self.buffer.poses[:n_frames].float(),
+            self.buffer.depths[:n_frames, 0].float(),
+            self.buffer.depths_sens_scale[:n_frames, 0].float(),
+            self.buffer.non_sky_masks[:n_frames, 0],
+            self.buffer.intrinsics[0].float() / float(stride),
+            ii,
+            jj,
+            stride,
         )
 
-    def _filter_new_edges(self, ii, jj):
-        if ii.numel() == 0:
-            return ii, jj
-
-        existing = set(self._sync_active_edge_set())
-        existing.update(self.edges._sync_edge_set())
-        ii_cpu = ii.cpu().tolist()
-        jj_cpu = jj.cpu().tolist()
+    def _filter_new_edges(self, ii: torch.Tensor, jj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        existing = set(self.edges._sync_edge_set())
         keep = []
-        for idx, (i, j) in enumerate(zip(ii_cpu, jj_cpu)):
+        for idx, (i, j) in enumerate(zip(ii.cpu().tolist(), jj.cpu().tolist())):
             directed_pair = (int(i), int(j))
-            if directed_pair not in existing:
-                keep.append(idx)
-
+            if directed_pair in existing:
+                continue
+            keep.append(idx)
+            existing.add(directed_pair)
         if not keep:
             empty = torch.as_tensor([], dtype=torch.long, device=ii.device)
             return empty, empty
-
         keep = torch.as_tensor(keep, dtype=torch.long, device=ii.device)
         return ii[keep], jj[keep]
+
+    def add_measurement_result(self, result: dict) -> dict:
+        n_candidates = int(result["ii"].numel())
+        observability_logits = result["depth_observability_logits"]
+        assert observability_logits.shape[0] == n_candidates
+        observability_score = observability_logits.float().flatten(1).mean(dim=1)
+        observability_rank = torch.full(
+            result["ii"].shape,
+            int(result["depth_observability_rank"]),
+            device=result["ii"].device,
+            dtype=torch.uint8,
+        )
+        keep = self.edges.add(
+            result["ii"],
+            result["jj"],
+            result["relative_pose"],
+            self.buffer.depths_sens_scale[result["ii"], 0].float(),
+            result["confidence"],
+            observability_score,
+            observability_rank,
+        )
+        n_added = int(keep.sum().item())
+        added_ii = result["ii"][keep] if n_added > 0 else torch.as_tensor([], dtype=torch.long, device=self.device)
+        out = dict(result)
+        out["n_added"] = n_added
+        out["n_duplicates"] = n_candidates - n_added
+        out["changed_sources"] = torch.unique(added_ii) if n_added > 0 else added_ii
+        return out
 
     def _bidirectional_pairs(self, ii: torch.Tensor, jj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.cat((ii, jj), dim=0), torch.cat((jj, ii), dim=0)
@@ -440,7 +262,8 @@ class FactorGraph(InitializationFactorGraph):
             if nms > 0:
                 suppressed = False
                 for selected_i, selected_j in selected:
-                    if abs(i - selected_i) <= nms and abs(j - selected_j) <= nms:
+                    suppression_radius = max(min(abs(selected_i - selected_j) - 2, int(nms)), 0)
+                    if abs(i - selected_i) + abs(j - selected_j) <= suppression_radius:
                         suppressed = True
                         break
                 if suppressed:
@@ -452,12 +275,11 @@ class FactorGraph(InitializationFactorGraph):
         if not selected:
             empty = torch.as_tensor([], dtype=torch.long, device=self.device)
             return empty, empty
-
         selected_ii = torch.as_tensor([pair[0] for pair in selected], dtype=torch.long, device=self.device)
         selected_jj = torch.as_tensor([pair[1] for pair in selected], dtype=torch.long, device=self.device)
         return selected_ii, selected_jj
 
-    def add_proximity_factors(
+    def select_proximity_edges(
         self,
         source_start: int,
         target_start: int,
@@ -465,92 +287,59 @@ class FactorGraph(InitializationFactorGraph):
         radius: int,
         nms: int,
         thresh: float = 16.0,
-    ) -> int:
-        before = int(self.ii.numel())
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         sources = torch.arange(source_start, end, device=self.device)
         targets = torch.arange(target_start, end, device=self.device)
+        empty = torch.as_tensor([], dtype=torch.long, device=self.device)
         if sources.numel() == 0 or targets.numel() == 0:
-            return 0
+            return empty, empty
 
-        ii, jj = torch.meshgrid(
-            sources,
-            targets,
-            indexing="ij",
-        )
+        ii, jj = torch.meshgrid(sources, targets, indexing="ij")
         ii = ii.reshape(-1).long()
         jj = jj.reshape(-1).long()
+        selected_ii_chunks: list[torch.Tensor] = []
+        selected_jj_chunks: list[torch.Tensor] = []
 
         local = (ii > jj) & ((ii - jj) <= int(radius))
         local_ii, local_jj = self._bidirectional_pairs(ii[local], jj[local])
-        self.add_factors(local_ii, local_jj)
+        local_ii, local_jj = self._filter_new_edges(local_ii, local_jj)
+        if local_ii.numel() > 0:
+            selected_ii_chunks.append(local_ii)
+            selected_jj_chunks.append(local_jj)
 
         proximity = (ii - jj) > int(radius)
         cand_ii, cand_jj = self._filter_new_edges(ii[proximity], jj[proximity])
-        if cand_ii.numel() == 0:
-            return int(self.ii.numel()) - before
+        if cand_ii.numel() > 0:
+            distance = self.projection_distance(cand_ii, cand_jj)
+            keep = distance <= float(thresh)
+            if keep.any():
+                cand_ii, cand_jj, distance = cand_ii[keep], cand_jj[keep], distance[keep]
+                prox_ii, prox_jj = self._select_proximity_nms(
+                    cand_ii,
+                    cand_jj,
+                    distance,
+                    nms=int(nms),
+                    max_pairs=-1,
+                )
+                prox_ii, prox_jj = self._bidirectional_pairs(prox_ii, prox_jj)
+                prox_ii, prox_jj = self._filter_new_edges(prox_ii, prox_jj)
+                if prox_ii.numel() > 0:
+                    selected_ii_chunks.append(prox_ii)
+                    selected_jj_chunks.append(prox_jj)
 
-        distance = self.projection_distance(cand_ii, cand_jj)
-        keep = distance <= float(thresh)
-        if not keep.any():
-            return int(self.ii.numel()) - before
+        if not selected_ii_chunks:
+            return empty, empty
+        return torch.cat(selected_ii_chunks), torch.cat(selected_jj_chunks)
 
-        cand_ii, cand_jj, distance = cand_ii[keep], cand_jj[keep], distance[keep]
-        selected_ii, selected_jj = self._select_proximity_nms(
-            cand_ii,
-            cand_jj,
-            distance,
-            nms=int(nms),
-            max_pairs=-1,
-        )
-        selected_ii, selected_jj = self._bidirectional_pairs(selected_ii, selected_jj)
-        self.add_factors(selected_ii, selected_jj)
-        return int(self.ii.numel()) - before
+    def edge_neighbors(self, source: int, *, window_start: int | None = None, window_end: int | None = None) -> torch.Tensor:
+        mask = self.edges.ii == int(source)
+        if window_start is not None:
+            mask &= self.edges.jj >= int(window_start)
+        if window_end is not None:
+            mask &= self.edges.jj < int(window_end)
+        return self.edges.jj[mask]
 
-    def rm_factors(self, mask: torch.Tensor):
-        """drop edges from factor graph"""
-
-        self.ii = self.ii[~mask]
-        self.jj = self.jj[~mask]
-        self.embed = self.embed[~mask]
-        self._active_edge_set = {
-            (int(i), int(j)) for i, j in zip(self.ii.cpu().tolist(), self.jj.cpu().tolist())
-        }
-
-    def oldest_active_keyframe(self) -> int | None:
-        return self.oldest_keyframe()
-
-    def marginalize_keyframe(self, keyframe: int, use_fp16: bool = False) -> dict | None:
-        result = super().marginalize_keyframe(keyframe, use_fp16=use_fp16, decode_depth=False)
-        if result is None:
-            return None
-        ii, jj, pose, scale, confidence, outlier_info = _filter_frontend_edges_by_confidence(
-            result["ii"],
-            result["jj"],
-            result["relative_pose"],
-            result["relative_scale"],
-            result["confidence"],
-            trans_conf_thresh=self.frontend_outlier_trans_conf_thresh,
-        )
-        result["n_finalized"] = self.edges.add(
-            ii,
-            jj,
-            pose,
-            scale,
-            confidence,
-        )
-        self._update_frontend_outlier_info(
-            outlier_info,
-            duplicate_filtered_after_gate=int(ii.numel()) - int(result["n_finalized"]),
-        )
-        result["ii"] = ii
-        result["jj"] = jj
-        result["relative_pose"] = pose
-        result["relative_scale"] = scale
-        result["confidence"] = confidence
-        result["frontend_outlier_info"] = dict(outlier_info)
-        return result
-
-    def optimize_finalized_pose_graph(
+    def optimize_pose_graph(
         self,
         anchor: int = 0,
         n_iters: int = 12,
@@ -560,11 +349,16 @@ class FactorGraph(InitializationFactorGraph):
         scale_conf: float = 0.01,
         mode: str = "staged",
         backend: str = "cuda_eigen",
+        extra_info: dict | None = None,
     ):
         n_frames = self.buffer.n_frames
         initial_poses = self.buffer.poses[:n_frames].clone()
         initial_log_scales = torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6))
-        return self._optimize_finalized_pose_graph_with_initial_state(
+        pgo_info = dict(self.edges.pgo_info)
+        pgo_info.update({"scope": "full_graph", "global_anchor": int(anchor)})
+        if extra_info is not None:
+            pgo_info.update(extra_info)
+        return self._optimize_pose_graph_with_initial_state(
             initial_poses=initial_poses,
             initial_log_scales=initial_log_scales,
             anchor=anchor,
@@ -575,13 +369,10 @@ class FactorGraph(InitializationFactorGraph):
             scale_conf=scale_conf,
             mode=mode,
             backend=backend,
-            pgo_info={
-                "scope": "frontend_full_graph",
-                "global_anchor": int(anchor),
-            },
+            pgo_info=pgo_info,
         )
 
-    def _optimize_finalized_pose_graph_with_initial_state(
+    def _optimize_pose_graph_with_initial_state(
         self,
         initial_poses: torch.Tensor,
         initial_log_scales: torch.Tensor,
@@ -632,11 +423,10 @@ class FactorGraph(InitializationFactorGraph):
         self.buffer.depths_sens_scale[: self.buffer.n_frames, 0] = new_scales
         result.info = dict(result.info)
         result.info.update(pgo_info)
-        result.info.update(self._frontend_outlier_public_info())
         self.edges.pgo_info = result.info
         return result
 
-    def optimize_finalized_pose_graph_window(
+    def optimize_pose_graph_window(
         self,
         window_start: int,
         window_end: int,
@@ -715,7 +505,6 @@ class FactorGraph(InitializationFactorGraph):
                 "global_anchor": int(window_start),
             }
         )
-        pgo_info.update(self._frontend_outlier_public_info())
         result.info = pgo_info
         self.edges.pgo_info = pgo_info
         return result
@@ -731,6 +520,3 @@ class FactorGraph(InitializationFactorGraph):
         self.buffer.poses[window_end : self.buffer.n_frames] = (suffix_from_tail * new_tail).data.to(
             dtype=self.buffer.poses.dtype
         )
-
-    def _motion_tokens_from_keyframe(self, keyframe: int, neighbors: torch.Tensor) -> torch.Tensor:
-        return self.embed[self.ii == keyframe]
