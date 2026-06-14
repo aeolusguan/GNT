@@ -24,12 +24,10 @@ slam:
   local_edge_max_rotation_deg: 30.0
   local_edge_max_translation: 5.0
   keyframe_motion_thresh: 2.5
-  local_mapping_window: 8
+  local_mapping_window: 25
   local_mapping_radius: 2
   local_mapping_nms: 1
   local_mapping_thresh: 16.0
   local_pgo_every: 1
-  local_refine_depth: true
-  depth_bootstrap_neighbors: 2
-  depth_refine_observability_topk: 4
+  tracking_multiview_neighbors: 2
   use_fp16: true

@@ -21,7 +21,6 @@
 import warnings
 
 import torch
-from lietorch import SE3
 
 from .buffer import GraphBuffer
 from geont_runtime.slam.pgo import DEFAULT_LM_MAX_ATTEMPTS, optimize_sim3_pose_graph
@@ -359,7 +358,6 @@ class FactorGraph:
         initial_log_scales = torch.log(
             self.buffer.depths_sens_scale[window_start:window_end, 0].clamp_min(1e-6)
         )
-        old_window_tail_pose = self.buffer.poses[window_end - 1].clone()
 
         self.edges.pgo_replay = make_pgo_replay_graph(
             n_nodes=window_size,
@@ -391,7 +389,6 @@ class FactorGraph:
             backend=backend,
         )
         self.buffer.poses[window_start:window_end] = result.poses.to(dtype=self.buffer.poses.dtype)
-        self._propagate_window_suffix_poses(window_end, old_window_tail_pose)
         new_scales = torch.exp(result.log_scales).to(dtype=self.buffer.depths_sens_scale.dtype)
         self.buffer.depths_sens_scale[window_start:window_end, 0] = new_scales
         pgo_info = dict(result.info)
@@ -406,15 +403,3 @@ class FactorGraph:
         result.info = pgo_info
         self.edges.pgo_info = pgo_info
         return result
-
-    def _propagate_window_suffix_poses(self, window_end: int, old_window_tail_pose: torch.Tensor):
-        if window_end >= self.buffer.n_frames:
-            return
-
-        suffix = SE3(self.buffer.poses[window_end : self.buffer.n_frames].float())
-        old_tail = SE3(old_window_tail_pose.float().view(1, 7))
-        new_tail = SE3(self.buffer.poses[window_end - 1].float().view(1, 7))
-        suffix_from_tail = suffix * old_tail.inv()
-        self.buffer.poses[window_end : self.buffer.n_frames] = (suffix_from_tail * new_tail).data.to(
-            dtype=self.buffer.poses.dtype
-        )

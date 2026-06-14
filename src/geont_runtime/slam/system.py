@@ -140,7 +140,7 @@ class SLAMSystem:
             depth=normed_depth,
             depth_sens_normed=normed_depth,
             scale=scale,
-            mask=non_sky_mask,
+            mask=torch.logical_and(non_sky_mask, mono_depth < 80),
             bases=bases,
             intrinsics=intrinsics,
         )
@@ -199,7 +199,9 @@ class SLAMSystem:
                 continue
 
             self.backend.update_local_graph(current_keyframe)
-            self.backend.optimize_local_window(current_keyframe)
+            local_pgo_keyframe = current_keyframe - self.backend.local_mapping_radius
+            if local_pgo_keyframe >= 0:
+                self.backend.optimize_local_window(local_pgo_keyframe)
 
         self.backend.finalize_pending_keyframes()
         self.backend.optimize_full_graph()

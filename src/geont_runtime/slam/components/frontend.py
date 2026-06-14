@@ -110,7 +110,7 @@ class SLAMFrontend:
                 subset[key] = value
         return subset
 
-    def _seed_source_pose_from_measurement(self, result: dict, source: int, target: int, scale: float) -> None:
+    def _seed_source_pose_from_measurement(self, result: dict, source: int, target: int, scale: torch.Tensor) -> None:
         edge = (result["ii"] == int(source)) & (result["jj"] == int(target))
         assert edge.any()
         edge_idx = int(torch.nonzero(edge, as_tuple=False)[0].item())
@@ -149,9 +149,10 @@ class SLAMFrontend:
         if mask.any():
             source_mean = keyframe_candidate.depth_sens_normed[0].float()[mask].mean().clamp_min(1e-6)
             refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
-            scale = keyframe_candidate.scale * (source_mean / refined_mean)
+            tracking_scale_ratio = source_mean / refined_mean
         else:
-            scale = keyframe_candidate.scale
+            tracking_scale_ratio = torch.ones((), device=self.device, dtype=torch.float)
+        scale = keyframe_candidate.scale * tracking_scale_ratio
         self._seed_source_pose_from_measurement(last_result, current_keyframe, last_keyframe, scale)
 
         return {

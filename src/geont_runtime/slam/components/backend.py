@@ -158,7 +158,7 @@ class SLAMBackend:
             damping=self.pgo_damping,
             lm_max_attempts=self.pgo_lm_max_attempts,
             huber_delta=self.pgo_huber_delta,
-            scale_conf=self.pgo_scale_conf,
+            scale_conf=10 * self.pgo_scale_conf,
             mode="rotation_only" if self.pgo_rotation_only else self.pgo_mode,
             backend=self.pgo_backend,
         )
