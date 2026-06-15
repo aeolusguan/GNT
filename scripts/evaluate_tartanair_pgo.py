@@ -176,7 +176,7 @@ def _trajectory_metrics(est_poses: np.ndarray, gt_poses: np.ndarray) -> dict[str
     trans_err = np.linalg.norm(aligned_t - gt_t, axis=1)
     rot_err = _rotation_errors_deg(est_poses[:, 3:7], gt_poses[:, 3:7], align_R)
     return {
-        "keyframes": int(est_poses.shape[0]),
+        "pose_count": int(est_poses.shape[0]),
         "sim3_scale": scale,
         "ate_rmse": float(np.sqrt(np.mean(trans_err * trans_err))),
         "ate_mean": float(np.mean(trans_err)),
@@ -365,12 +365,16 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
 
     slam_output = pipeline.run(stream).payload
     assert slam_output is not None
-    est_poses = slam_output.trajectory.data.detach().cpu().numpy()
-    selected_ids = int(cfg.frame_start) + slam_output.keyframe_ids.astype(np.int64) * int(cfg.frame_skip)
-    gt_poses = _load_gt_poses(scene_dir)[selected_ids]
+    if slam_output.frame_trajectory is None or slam_output.frame_timestamps is None:
+        raise RuntimeError("SLAMOutput must provide every-frame trajectory for pose evaluation.")
+    gt_poses_all = _load_gt_poses(scene_dir)
+    est_poses = slam_output.frame_trajectory.data.detach().cpu().numpy()
+    pose_ids = int(cfg.frame_start) + slam_output.frame_timestamps.astype(np.int64) * int(cfg.frame_skip)
+    keyframe_ids = int(cfg.frame_start) + slam_output.keyframe_ids.astype(np.int64) * int(cfg.frame_skip)
+    gt_poses = gt_poses_all[pose_ids]
 
     metrics = _trajectory_metrics(est_poses, gt_poses)
-    edge_rows = _edge_error_rows(split_scene, selected_ids, gt_poses, slam_output)
+    edge_rows = _edge_error_rows(split_scene, keyframe_ids, gt_poses_all[keyframe_ids], slam_output)
     edge_csv = output_dir / "edge_relative_pose_errors.csv"
     _write_edge_csv(edge_csv, edge_rows)
     pgo_info = slam_output.pgo_info or {}
@@ -380,7 +384,7 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
             replay_graph,
             slam_output.pgo_replay,
             pgo_info=pgo_info,
-            timestamps=selected_ids,
+            timestamps=keyframe_ids,
         )
     metrics.update(
         {
@@ -388,6 +392,7 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
             "scene": split_scene,
             "resolved_scene": str(scene_dir),
             "frames": int(len(stream)),
+            "keyframes": int(slam_output.trajectory.data.shape[0]),
             "first_frame": int(cfg.frame_start),
             "frame_skip": int(cfg.frame_skip),
             "edge_count": int((slam_output.pose_edges or {}).get("ii", torch.empty(0)).numel()),
@@ -418,6 +423,7 @@ def _summarize(rows: list[dict], edge_rows: list[dict]) -> dict[str, float]:
         "rot_mean_deg",
         "rot_median_deg",
         "rot_max_deg",
+        "pose_count",
         "keyframes",
         "edge_count",
         "pgo_runtime_sec",

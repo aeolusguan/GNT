@@ -173,6 +173,8 @@ class SLAMSystem:
             pgo_replay=dict(edges.pgo_replay),
             slam_map=None,
             timestamps=self.buffer.tstamp[:n_frames].cpu().numpy(),
+            frame_trajectory=self.frontend.make_frame_trajectory(),
+            frame_timestamps=self.frontend.frame_timestamps(),
         )
 
     def _run_streaming_local_mapping(

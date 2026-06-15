@@ -79,6 +79,14 @@ class DefaultAnnotationPipeline(Pipeline):
             for key, value in pose_edges.items()
         }
         replay_np = pgo_replay_npz_payload(slam_output.pgo_replay)
+        frame_np = {}
+        if slam_output.frame_trajectory is not None:
+            frame_trajectory = slam_output.frame_trajectory.data
+            if isinstance(frame_trajectory, torch.Tensor):
+                frame_trajectory = frame_trajectory.cpu().numpy()
+            frame_np["frame_trajectory"] = frame_trajectory
+        if slam_output.frame_timestamps is not None:
+            frame_np["frame_timestamps"] = slam_output.frame_timestamps
 
         np.savez_compressed(
             artifact_path.pose_path,
@@ -88,6 +96,7 @@ class DefaultAnnotationPipeline(Pipeline):
             log_scales=log_scales,
             scales=scales,
             pgo_info=np.array(json.dumps(pgo_info)),
+            **frame_np,
             **edge_np,
             **replay_np,
         )

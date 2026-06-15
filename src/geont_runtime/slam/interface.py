@@ -50,6 +50,8 @@ class SLAMOutput:
     pgo_replay: dict[str, torch.Tensor] | None = None
     slam_map: SLAMMap | None = None
     timestamps: np.ndarray | None = None
+    frame_trajectory: SE3 | None = None
+    frame_timestamps: np.ndarray | None = None
 
     @property
     def scales(self) -> torch.Tensor | None:
@@ -65,6 +67,12 @@ class SLAMOutput:
         return np.array(self.slam_map.dense_depth_frame_inds)
 
     def get_trajectory(self, n_frames: int | None = None):
+        if self.frame_trajectory is not None:
+            n = self.frame_trajectory.data.shape[0]
+            if n_frames is not None:
+                assert int(n_frames) == n
+            return [self.frame_trajectory[i] for i in range(n)]
+
         trajectory = self.trajectory
         n = trajectory.data.shape[0]
         if n == 0:

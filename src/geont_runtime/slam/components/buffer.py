@@ -98,6 +98,12 @@ class GraphBuffer:
             device=device,
             dtype=torch.float,
         )
+        self.pgo_base_scale = torch.zeros(
+            buffer_size,
+            self.n_views,
+            device=device,
+            dtype=torch.float,
+        )
         # Non sky mask
         self.non_sky_masks = torch.zeros(
             buffer_size,

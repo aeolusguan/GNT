@@ -80,7 +80,9 @@ class SLAMBackend:
         if mask.any():
             source_mean = self.buffer.depths_sens_normed[source, 0].float()[mask].mean().clamp_min(1e-6)
             refined_mean = refined_depth[mask].mean().clamp_min(1e-6)
-            self.buffer.depths_sens_scale[source, 0] *= source_mean / refined_mean
+            new_base_scale = self.buffer.depths_sens_scale[source, 0] * (source_mean / refined_mean)
+            self.buffer.depths_sens_scale[source, 0] = new_base_scale
+            self.buffer.pgo_base_scale[source, 0] = new_base_scale
         self.buffer.depths[source, 0] = refined_depth.to(dtype=self.buffer.depths.dtype)
         self.buffer.depth_status[source] = DEPTH_STATUS_REFINED
         self.buffer.depth_dirty[source] = True
