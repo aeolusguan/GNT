@@ -80,7 +80,7 @@ def camara_loss(pred_pose_enc, gt_pose_enc, loss_type="l1", conf=None):
     """
     pred_q = pred_pose_enc[..., 3:7]
     gt_q = gt_pose_enc[..., 3:7]
-    pred_q = torch.where((pred_q * gt_q).sum(dim=-1, keepdim=True) < 0, -pred_q, pred_q)
+    gt_q = torch.where(gt_q[..., 3:4] < 0, -gt_q, gt_q)
     quat_residual = pred_q - gt_q
 
     if loss_type == "l1":
@@ -132,23 +132,20 @@ class MultitaskLoss(torch.nn.Module):
         pr_rel_poses = SE3(predictions["pose_graph"])
         pr_rel_poses_log_variance = predictions["pose_graph_log_variance"]
         gt_depth = batch["depth"]
+        # pr_depth/gt_depth/valid_mask: [B,S,H,W].
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
 
-        normed_gt_depth, gt_scale = normalize_depth(gt_depth.flatten(0, 1), valid_mask.flatten(0, 1))
-        normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
-        gt_scale = gt_scale.view(*gt_depth.shape[:2])
-        pr_scale = pr_scale.view(*pr_depth.shape[:2])
-        normed_gt_depth = normed_gt_depth.view(*gt_depth.shape)
-        normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
+        # Flatten frames to compute one valid-pixel mean depth per frame: [B*S,H,W].
+        gt_depth_target, gt_scale = normalize_depth(gt_depth.flatten(0, 1), valid_mask.flatten(0, 1))
+        gt_scale = gt_scale.view(*gt_depth.shape[:2])  # [B,S]
+        gt_depth_target = gt_depth_target.view(*gt_depth.shape)  # [B,S,H,W]
 
         graph = batch["graph"]
         gt_pose = SE3(batch["poses"]).inv()  # convert poses w2c -> c2w
 
         intrinsics = batch["intrinsics"]
 
-        # cam_loss, geo_metrics = geodesic_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_scale, pr_rel_poses_log_variance)
-        # cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
-        cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, pr_scale, gt_scale, pr_rel_poses_log_variance)
+        cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_rel_poses_log_variance)
         cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
         flo_loss, front_flow_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask, flow_predictions=predictions["flow_predictions"], args=self.args)
         flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
@@ -171,34 +168,24 @@ class MultitaskLoss(torch.nn.Module):
 
         # NOTE: we put conf inside compute_depth_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
         # this is hacky, but very easier to implement
-        depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, pr_depth_conf, valid_mask)
+        depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(pr_depth, gt_depth_target, pr_depth_conf, valid_mask)
         depth_loss = depth_grad_loss + depth_conf_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
 
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss + self.args.w_front_flow * front_flow_loss
 
-        # Compute auxiliary losses for intermediate layers
-        # L = predictions["depth"].shape[2] # number of output layers
-        # assert len(self.args.w_depth_aux) == L - 1, "Length of w_depth_aux should be num_out_layers - 1"
-        # for i in range(L-1):
-        #     pr_depth = predictions["depth"][:, :, i].clip(max=100, min=1e-3)
-        #     normed_pr_depth, pr_scale = normalize_depth(pr_depth.flatten(0, 1), valid_mask.flatten(0, 1))
-        #     normed_pr_depth = normed_pr_depth.view(*pr_depth.shape)
-        #     depth_reg_loss, depth_grad_loss = self.compute_depth_loss(normed_pr_depth, normed_gt_depth, valid_mask)
-        #     depth_loss = depth_grad_loss + depth_reg_loss
-
-        #     total_loss += self.args.w_depth_aux[i] * self.args.w_depth * depth_loss
         return total_loss, geo_metrics, flo_metrics, depth_metrics
         #return total_loss, {}, flo_metrics, {}
     
-    def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, pr_scale, gt_scale, pr_rel_pose_log_variance):
+    def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, gt_scale, pr_rel_pose_log_variance):
         # relative pose
         ii, jj, kk = graph_to_edge_list(graph)
         dP = gt_pose[:,jj] * gt_pose[:,ii].inv()
 
-        # scale the relative poses
+        # gt_scale[:, ii]: [B,E], one source depth scale per relative edge.
+        # GT relative translation is supervised in the source normalized-depth gauge.
+        # Predictions are already expected to live in this gauge.
         dP = dP.scale(1.0 / gt_scale[:, ii])
-        pr_rel_poses = pr_rel_poses.scale(1.0 / pr_scale[:, ii])
 
         loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data, conf=pr_rel_pose_log_variance)
         cam_loss = loss_T + loss_R
@@ -215,9 +202,9 @@ class MultitaskLoss(torch.nn.Module):
 
         return cam_loss, metrics
     
-    def compute_depth_loss(self, normed_pr_depth, normed_gt_depth, depth_conf, valid_mask, alpha=0.2):
+    def compute_depth_loss(self, pr_depth, gt_depth_target, depth_conf, valid_mask, alpha=0.2):
         # Compute L1 loss between predicted and ground truth points
-        depth_reg_loss = torch.abs(normed_pr_depth - normed_gt_depth)
+        depth_reg_loss = torch.abs(pr_depth - gt_depth_target)
         depth_reg_loss = depth_reg_loss[valid_mask]
 
         # Confidence-weighted loss: loss * conf - alpha * log(conf)
@@ -225,8 +212,8 @@ class MultitaskLoss(torch.nn.Module):
         depth_conf_loss = check_and_fix_inf_nan(depth_conf_loss, "depth_conf_loss")
 
         depth_grad_loss = gradient_loss_multi_scale_wrapper(
-            normed_pr_depth.flatten(0, 1).unsqueeze(-1),
-            normed_gt_depth.flatten(0, 1).unsqueeze(-1),
+            pr_depth.flatten(0, 1).unsqueeze(-1),
+            gt_depth_target.flatten(0, 1).unsqueeze(-1),
             valid_mask.flatten(0, 1),
             gradient_loss_fn=gradient_loss,
         )
@@ -240,7 +227,7 @@ class MultitaskLoss(torch.nn.Module):
             
             depth_conf_loss = depth_conf_loss.mean()
         else:
-            depth_conf_loss = (0.0 * normed_pr_depth).mean()
+            depth_conf_loss = (0.0 * pr_depth).mean()
 
         # Process regular regression loss
         if depth_reg_loss.numel() > 0:
@@ -250,7 +237,7 @@ class MultitaskLoss(torch.nn.Module):
 
             depth_reg_loss = depth_reg_loss.mean()
         else:
-            depth_reg_loss = (0.0 * normed_pr_depth).mean()
+            depth_reg_loss = (0.0 * pr_depth).mean()
 
         return depth_conf_loss, depth_grad_loss, depth_reg_loss
 
