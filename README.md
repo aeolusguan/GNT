@@ -10,7 +10,7 @@ The codebase is organized as a modern `src/` Python project:
 src/geont/          # model architecture, training, losses, data, geometry
 src/geont_runtime/  # inference, streams, SLAM, pose graph optimization
 configs/            # Hydra runtime and experiment configs
-scripts/            # evaluation, replay, profiling, and visualization tools
+scripts/            # evaluation, ablation, diagnostics, and visualization tools
 third_party/        # vendored external dependencies
 ```
 
@@ -123,39 +123,48 @@ graph conventions.
 
 ## Training
 
-GeoNT training lives under the `geont` package:
+GeoNT training uses the root training script:
 
 ```bash
-python -m geont.training \
-  --datapath datasets/TartanAir \
-  --output_dir output/geont_train
+python training.py \
+  --config-name=geont_train \
+  datapath=datasets/TartanAir \
+  output_dir=output/geont_train
 ```
 
 Useful options include:
 
 ```text
---pretrained      optional starting checkpoint
---resume          resume checkpoint path
---batch_size      per-GPU batch size
---epochs          number of training epochs
---n_frames        number of frames sampled per training example
---edges           training graph edge budget
+init.da3.path                    DA3 safetensors initialization source for non-resume training
+resume                           resume training checkpoint path
+batch_size                       per-GPU batch size
+epochs                           number of training epochs
+n_frames                         number of frames sampled per training example
+edges                            training graph edge budget
 ```
 
-For the legacy root launcher, use:
+Set `resume=...` to restore a training checkpoint. Otherwise, set
+`init.da3.path`.
+
+For DA3-SMALL initialization, set the model shape from config and use the
+HuggingFace safetensors source:
 
 ```bash
-python launch.py --datapath datasets/TartanAir --output_dir output/geont_train
+python training.py --config-name=geont_train \
+  model.gnt.backbone.name=vits \
+  model.gnt.backbone.img_size=518 \
+  model.gnt.backbone.patch_size=14 \
+  init.da3.path=depth-anything/DA3-SMALL
 ```
 
 ## Evaluation and analysis scripts
 
-The `scripts/` directory contains experiment helpers for pose-graph replay,
-TartanAir evaluation, profiling, and visualization. Examples:
+The `scripts/` directory contains experiment helpers for TartanAir evaluation,
+PGO ablation, diagnostics, and visualization. Examples:
 
 ```bash
 python scripts/evaluate_tartanair_pgo.py
-python scripts/replay_pgo.py graph=outputs/example/pgo_replay_graph.npz backend=cuda_eigen
+python scripts/ablate_pgo_moge_mode_count.py --artifact-root outputs/streaming_eval
 python scripts/visualize_init_graph.py outputs/pose/example.npz --output outputs/pose/example_init_graph.svg
 ```
 

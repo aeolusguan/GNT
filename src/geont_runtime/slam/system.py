@@ -131,21 +131,22 @@ class SLAMSystem:
         images: torch.Tensor,
         intrinsics: torch.Tensor,
     ) -> KeyframeCandidate:
-        gmap, mono_depth, non_sky_mask = self.gnt.encode_features(images, intrinsics)
-        normed_depth, scale = self.gnt.normalize_depth(mono_depth, non_sky_mask)
-        bases = self.gnt.encode_bases(mono_depth, non_sky_mask)
+        gmap, mono_depth, non_sky_mask = self.measurements.moge_prior(images, intrinsics)
+        normalization_mask = non_sky_mask & (mono_depth < 80)
+        normed_depth, scale = self.gnt.normalize_depth(mono_depth, normalization_mask)
+        bases = self.measurements.encode_bases(mono_depth, non_sky_mask)
         return KeyframeCandidate(
             frame_idx=int(frame_idx),
             fmap=gmap,
             depth=normed_depth,
             depth_sens_normed=normed_depth,
             scale=scale,
-            mask=torch.logical_and(non_sky_mask, mono_depth < 80),
+            mask=normalization_mask,
             bases=bases,
             intrinsics=intrinsics,
         )
 
-    def _precompute_features(self, frame_data: VideoFrame):
+    def _frame_to_model_inputs(self, frame_data: VideoFrame):
         assert frame_data.intrinsics is not None
         images = rearrange(frame_data.rgb[None], "n h w c -> n c h w")
         intrinsics = frame_data.intrinsics[None]
@@ -157,7 +158,8 @@ class SLAMSystem:
         return SLAMOutput(
             trajectory=SE3(self.buffer.poses[:n_frames]),
             intrinsics=original_intrinsics,
-            log_scales=torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6)),
+            log_scales=torch.log(self.buffer.scale[:n_frames, 0].clamp_min(1e-6)),
+            moge_log_scales=torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6)),
             depths=self.buffer.depths[:n_frames],
             depth_masks=self.buffer.non_sky_masks[:n_frames],
             depth_status=self.buffer.depth_status[:n_frames].clone(),
@@ -166,11 +168,10 @@ class SLAMSystem:
                 "ii": edges.ii,
                 "jj": edges.jj,
                 "relative_pose": edges.relative_pose,
-                "relative_scale": edges.relative_scale,
+                "relative_log_scale": edges.relative_log_scale,
                 "confidence": edges.confidence,
             },
             pgo_info=dict(edges.pgo_info),
-            pgo_replay=dict(edges.pgo_replay),
             slam_map=None,
             timestamps=self.buffer.tstamp[:n_frames].cpu().numpy(),
             frame_trajectory=self.frontend.make_frame_trajectory(),
@@ -187,31 +188,28 @@ class SLAMSystem:
         for frame_idx, frame_data in pbar(
             enumerate(video_stream), desc="GeoNT local mapping", total=total_n_frames
         ):
-            images, intrinsics = self._precompute_features(frame_data)
+            images, intrinsics = self._frame_to_model_inputs(frame_data)
             keyframe_candidate = self._make_keyframe_candidate(frame_idx, images, intrinsics)
-            tracking = self.frontend.track(
+            accepted = self.frontend.track(
                 keyframe_candidate,
                 force=frame_idx == total_n_frames - 1,
             )
-            if not tracking["accepted"]:
+            if not accepted:
                 continue
 
-            current_keyframe = int(tracking["keyframe"])
+            current_keyframe = self.buffer.n_frames - 1
             if current_keyframe == 0:
                 continue
 
             self.backend.update_local_graph(current_keyframe)
-            local_pgo_keyframe = current_keyframe - self.backend.local_mapping_radius
-            if local_pgo_keyframe >= 0:
-                self.backend.optimize_local_window(local_pgo_keyframe)
+            finalized_end = current_keyframe - self.backend.local_mapping_radius + 1
+            if finalized_end > 1:
+                self.backend.optimize_local_pgo(finalized_end)
 
         self.backend.finalize_pending_keyframes()
         self.backend.optimize_full_graph()
 
         edges = self.graph.edges
-        edges.pgo_info.update(self.frontend.tracking_info)
-        edges.pgo_info.update(self.backend.backend_info)
-        edges.pgo_info.update(self.backend.local_edge_outlier_info)
         return self._make_output(resizer, edges)
 
     @torch.no_grad()

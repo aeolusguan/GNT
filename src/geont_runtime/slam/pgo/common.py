@@ -13,18 +13,8 @@ LM_DAMPING_DECREASE = 0.5
 LM_DAMPING_INCREASE = 10.0
 LM_DAMPING_MIN = 1e-7
 LM_DAMPING_MAX = 1e7
-TORCH_SOLVER_INFO = {
-    "linear_solver": "dense_cholesky",
-    "normal_equation_assembly": "torch_dense",
-    "linear_solver_impl": "torch_cholesky_ex",
-}
-CUDA_EIGEN_SOLVER_INFO = {
-    "linear_solver": "eigen_cholesky",
-    "normal_equation_assembly": "cuda_blocks",
-    "linear_solver_impl": "cuda_extension_cpu_eigen_llt",
-}
 PGO_MODES = {"rotation_only", "staged", "se3_scale"}
-CUDA_EIGEN_BACKEND = "cuda_eigen"
+PGO_BACKENDS = {"torch", "cuda_eigen"}
 
 # Shape notation:
 #   N: number of pose-graph nodes, E: number of directed edges.
@@ -45,10 +35,10 @@ class Sim3PGOResult:
 
 @dataclass
 class RelativeEdges:
-    """Finalized edge measurements: poses.data is (E, 7), scales is (E,)."""
+    """Finalized edge measurements: poses.data is (E, 7), log_scales is (E,)."""
 
     poses: SE3
-    scales: torch.Tensor
+    log_scales: torch.Tensor
 
 
 def _apply_delta(
@@ -56,7 +46,7 @@ def _apply_delta(
     log_s: torch.Tensor,
     pose_delta: torch.Tensor,
     scale_delta: torch.Tensor,
-    anchor: int,
+    optimized_nodes: torch.Tensor,
 ):
     """Apply full pose/scale increments.
 
@@ -68,8 +58,6 @@ def _apply_delta(
         return poses, log_s
 
     pose_data = poses.data
-    node_ids = torch.arange(pose_data.shape[0], device=pose_data.device)
-    optimized_nodes = node_ids[node_ids != anchor]
     pose_new = pose_data.clone()
     if pose_delta.numel() > 0:
         delta_poses = SE3(torch.cat((pose_delta[:, :3], SO3.exp(pose_delta[:, 3:6]).data), dim=-1))
@@ -83,6 +71,25 @@ def _scaled_se3_residuals(
     ii: torch.Tensor,
     jj: torch.Tensor,
     rel_edges: RelativeEdges,
+) -> torch.Tensor:
+    meas_rotations_inv = SO3(rel_edges.poses.data[..., 3:7]).inv()
+    return _scaled_se3_residuals_cached_rotation(
+        poses,
+        log_s,
+        ii,
+        jj,
+        rel_edges,
+        meas_rotations_inv,
+    )
+
+
+def _scaled_se3_residuals_cached_rotation(
+    poses: SE3,
+    log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    rel_edges: RelativeEdges,
+    meas_rotations_inv: SO3,
 ) -> torch.Tensor:
     """Residual for GNT-normalized relative poses.
 
@@ -100,7 +107,7 @@ def _scaled_se3_residuals(
     pred_t = pred[..., :3] / torch.exp(log_s[ii]).clamp_min(EPS)[..., None]
     pred_q = pred[..., 3:7]
     err_t = pred_t - rel_edges.poses.data[..., :3]
-    err_r = (SO3(rel_edges.poses.data[..., 3:7]).inv() * SO3(pred_q)).log()
+    err_r = (meas_rotations_inv * SO3(pred_q)).log()
     return torch.cat((err_t, err_r), dim=-1)
 
 
@@ -160,29 +167,74 @@ def _so3_right_jacobian_inverse(phi: torch.Tensor) -> torch.Tensor:
 
 
 def _edge_sqrt_information(edge_conf: torch.Tensor):
-    """edge_conf is (E, 2) = [translation_conf, rotation_conf]; returns (E, 6)."""
+    """edge_conf is (E, 3) = [translation_conf, rotation_conf, scale_conf]; returns (E, 6)."""
     info = edge_conf[..., :2].clamp_min(0.0)
     return torch.sqrt(torch.cat((info[:, :1].expand(-1, 3), info[:, 1:2].expand(-1, 3)), dim=-1))
 
 
 def _rotation_sqrt_information(edge_conf: torch.Tensor):
-    """edge_conf is (E, 2); returns (E, 3) rotation sqrt information."""
+    """edge_conf is (E, 3); returns (E, 3) rotation sqrt information."""
     rot_info = edge_conf[..., 1]
     return torch.sqrt(rot_info.clamp_min(0.0))[:, None].expand(-1, 3)
 
 
 def _translation_sqrt_information(edge_conf: torch.Tensor):
-    """edge_conf is (E, 2); returns (E, 3) translation sqrt information."""
+    """edge_conf is (E, 3); returns (E, 3) translation sqrt information."""
     trans_info = edge_conf[..., 0]
     return torch.sqrt(trans_info.clamp_min(0.0))[:, None].expand(-1, 3)
 
 
-def _scale_prior_residuals(
-    log_s: torch.Tensor,
-    prior_log_s: torch.Tensor,
+def _scale_sqrt_information(edge_conf: torch.Tensor):
+    """edge_conf is (E, 3); returns (E,) scale sqrt information."""
+    return torch.sqrt(edge_conf[..., 2].clamp_min(0.0))
+
+
+def _dct_scale_modes(n_nodes: int, n_modes: int, reference: torch.Tensor) -> torch.Tensor:
+    """Mean-zero orthonormal DCT modes, excluding the global scale gauge."""
+    mode_count = min(int(n_modes), int(n_nodes))
+    samples = torch.arange(n_nodes, device=reference.device, dtype=reference.dtype) + 0.5
+    modes = torch.arange(1, mode_count, device=reference.device, dtype=reference.dtype)[:, None]
+    return torch.sqrt(reference.new_tensor(2.0 / float(n_nodes))) * torch.cos(
+        torch.pi * modes * samples[None, :] / float(n_nodes)
+    )
+
+
+def _regularize_mode_covariance(
+    covariance: torch.Tensor,
+    identity: torch.Tensor,
 ) -> torch.Tensor:
-    """Node-scale prior residuals: log_s/prior_log_s are (N,), returns (N,)."""
-    return log_s - prior_log_s
+    """Symmetrize a small marginalized covariance and add numerical jitter."""
+    covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+    jitter = (1e-6 * covariance.diagonal().abs().mean()).clamp_min(EPS)
+    return covariance + jitter * identity
+
+
+def _moge_mode_prior_covariance(
+    marginalized_covariance: torch.Tensor,
+    innovation: torch.Tensor,
+    nis_cutoff: float,
+) -> tuple[torch.Tensor, float, float]:
+    """Convert modal NIS into the covariance of a fixed MoGe mode factor."""
+    nis = innovation.square() / marginalized_covariance.diagonal().clamp_min(EPS)
+    score = nis.median()
+    alpha = float(nis_cutoff) / (float(nis_cutoff) + score)
+    alpha = alpha.clamp(min=1e-6, max=1.0 - 1e-4)
+    prior_covariance = ((1.0 - alpha) / alpha) * marginalized_covariance
+    return prior_covariance, float(score.cpu()), float(alpha.cpu())
+
+
+def _mode_quadratic_cost(residual: torch.Tensor, precision: torch.Tensor) -> torch.Tensor:
+    return 0.5 * torch.dot(residual, precision @ residual)
+
+
+def _relative_scale_residuals(
+    log_s: torch.Tensor,
+    ii: torch.Tensor,
+    jj: torch.Tensor,
+    rel_edges: RelativeEdges,
+) -> torch.Tensor:
+    """Relative scale residuals: log_s[j] - log_s[i] ~= edge log-scale."""
+    return log_s[jj] - log_s[ii] - rel_edges.log_scales
 
 
 def _initial_from_edges(

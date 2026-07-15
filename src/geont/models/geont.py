@@ -1,20 +1,17 @@
-from typing import Union, IO
 from pathlib import Path
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from hydra.utils import instantiate
 
-from .dinov2.dinov2 import DinoV2
 from .dinov2.layers import PatchEmbed
 from .cam_dec import CameraDec
+from .cam_enc import CameraEnc
 from .heads.transformer_head import TransformerDecoder
-from geont.geometry.graph_utils import graph_to_edge_list, keyframe_indices
+from geont.geometry.graph_utils import graph_to_edge_list
 from .external import load_moge
 from .flow.core.utils import InputPadder
 from .flow import load_flow
-from geont.geometry.projective_ops import projective_transform
-from lietorch import SE3
 
 
 class MotionPatchEmbed(nn.Module):
@@ -27,7 +24,7 @@ class MotionPatchEmbed(nn.Module):
 
         self.motion_embed = PatchEmbed(in_chans=5, patch_size=patch_size, embed_dim=embed_dim, flatten_embedding=False)
 
-    def forward(self, motion_field, info, intrinsics, var_min, var_max):
+    def forward(self, motion_field, info, source_intrinsics, target_intrinsics, var_min, var_max):
         # compute gate
         weight = torch.softmax(info[:, :2], dim=1)
         raw_b = info[:, 2:]
@@ -38,45 +35,38 @@ class MotionPatchEmbed(nn.Module):
         log_b[:, 1] = torch.clamp(raw_b[:, 1], min=var_min, max=0)
         info_final = (torch.exp(-log_b) * weight).sum(dim=1, keepdim=True)
 
-        # embed motion field
         ht, wd = motion_field.shape[-2:]
-        fx, fy, cx, cy = intrinsics[..., None, None, :].unbind(dim=-1)
+        assert source_intrinsics.shape == target_intrinsics.shape == (motion_field.shape[0], 4)
+        source_fx, source_fy, source_cx, source_cy = source_intrinsics[..., None, None, :].unbind(dim=-1)
+        target_fx, target_fy, target_cx, target_cy = target_intrinsics[..., None, None, :].unbind(dim=-1)
         v, u = torch.meshgrid(
-            torch.arange(ht, device=motion_field.device, dtype=torch.float),
-            torch.arange(wd, device=motion_field.device, dtype=torch.float),
+            torch.arange(ht, device=motion_field.device, dtype=motion_field.dtype),
+            torch.arange(wd, device=motion_field.device, dtype=motion_field.dtype),
             indexing="ij",
         )
-        x, y = (u - cx) / fx, (v - cy) / fy
+        source_x = (u + motion_field[:, 0] - source_cx) / source_fx
+        source_y = (v + motion_field[:, 1] - source_cy) / source_fy
+        target_x = (u - target_cx) / target_fx
+        target_y = (v - target_cy) / target_fy
 
-        # make flow intrinsic-invariant
-        dx, dy = motion_field[:, 0] / fx, motion_field[:, 1] / fy
-
-        x = x.expand(dx.shape[0], -1, -1)
-        y = y.expand(dy.shape[0], -1, -1)
-
-        # motion field encoder
-        motion_token = self.motion_embed(torch.stack((x, y, dx * 50, dy * 50, info_final.squeeze(1)), dim=1))
+        motion_token = self.motion_embed(
+            torch.stack((source_x, source_y, target_x, target_y, info_final.squeeze(1)), dim=1)
+        )
 
         return motion_token
 
         
 class GeoNT(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
 
-        self.backbone = DinoV2(
-            name='vitb',
-            out_layers=[5, 7, 9, 11],
-            alt_start=4,
-            qknorm_start=4,
-            rope_start=4,
-            cat_token=True,
-        )
+        self.backbone = instantiate(config["backbone"])
         self.embed_dim = self.backbone.pretrained.embed_dim
         self.patch_size = self.backbone.pretrained.patch_size
 
+        depth_head_dim_in = (2 if self.backbone.cat_token else 1) * self.embed_dim
         self.depth_head = TransformerDecoder(
-            in_dim=2*self.embed_dim,
+            in_dim=depth_head_dim_in,
             patch_size=self.patch_size,
             dec_embed_dim=512,
             dec_num_heads=8,
@@ -88,186 +78,142 @@ class GeoNT(nn.Module):
         )
         self.depth_patch_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size, embed_dim=self.embed_dim - self.embed_dim // 4 * 3, flatten_embedding=False)
         self.motion_patch_embed = MotionPatchEmbed(patch_size=self.patch_size, embed_dim=self.embed_dim // 4 * 3)
-        self.res_depth_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size//2, embed_dim=self.embed_dim, flatten_embedding=True)
+        self.res_depth_embed = PatchEmbed(in_chans=2, patch_size=self.patch_size // 2, embed_dim=self.embed_dim, flatten_embedding=True)
         
-        self.cam_dec = CameraDec(dim_in=1536)
+        cam_dec_dim_in = (2 if self.backbone.cat_token else 1) * self.embed_dim
+        self.cam_dec = CameraDec(dim_in=cam_dec_dim_in)
+        self.cam_enc = CameraEnc(embed_dim=self.embed_dim)
+
+    def encode_relative_pose_prior(
+        self,
+        relative_pose_prior: torch.Tensor,
+        relative_pose_prior_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert relative_pose_prior.ndim == 2 and relative_pose_prior.shape[-1] == 7
+        base_token = self.backbone.pretrained.camera_token[:, 1:, :]
+        prior_token = self.cam_enc(relative_pose_prior, base_token)
+        if relative_pose_prior_mask is None:
+            return prior_token
+
+        assert relative_pose_prior_mask.shape == (relative_pose_prior.shape[0],)
+        base = base_token.to(device=prior_token.device, dtype=prior_token.dtype).expand_as(prior_token)
+        mask = relative_pose_prior_mask.to(device=prior_token.device, dtype=torch.bool).view(-1, 1, 1)
+        return torch.where(mask, prior_token, base)
 
     def forward(
         self, 
         flow_predictions, 
         depth_predictions,
-        intrinsics: torch.Tensor,
-        export_feat_layers: list[int] | None = None,
+        source_intrinsics: torch.Tensor,
+        target_intrinsics: torch.Tensor,
+        target_depth_predictions,
         use_fp16: bool = False,
-        camera_prior: torch.Tensor | None = None,
+        decode_depth: bool = True,
+        relative_pose_prior: torch.Tensor | None = None,
+        relative_pose_prior_mask: torch.Tensor | None = None,
     ):
-        if export_feat_layers is None:
-            export_feat_layers = []
-
         # ---- motion tokenization ---- #
         flow = flow_predictions['final']
         flow_info = flow_predictions['info']
         var_min, var_max = flow_predictions['var_min'], flow_predictions['var_max']
 
-        motion_token = self.motion_patch_embed(flow, flow_info, intrinsics, var_min=var_min, var_max=var_max)
+        zero_flow = torch.zeros(1, *flow.shape[1:], device=flow.device, dtype=flow.dtype)
+        reference_info = torch.zeros(1, *flow_info.shape[1:], device=flow_info.device, dtype=flow_info.dtype)
+        all_flow = torch.cat((zero_flow, flow), dim=0)
+        all_info = torch.cat((reference_info, flow_info), dim=0)
+        assert source_intrinsics.shape == (4,)
+        assert target_intrinsics.shape == (flow.shape[0], 4)
+        reference_intrinsics = source_intrinsics[None]
+        all_source_intrinsics = torch.cat(
+            (reference_intrinsics, reference_intrinsics.expand(flow.shape[0], -1)),
+            dim=0,
+        )
+        all_target_intrinsics = torch.cat((reference_intrinsics, target_intrinsics), dim=0)
+        motion_token = self.motion_patch_embed(
+            all_flow,
+            all_info,
+            all_source_intrinsics,
+            all_target_intrinsics,
+            var_min=var_min,
+            var_max=var_max,
+        )
 
         # ---- depth tokenization ---- #
         depth = depth_predictions['depth']
         mask = depth_predictions['mask']
+        target_depth = target_depth_predictions['depth']
+        target_mask = target_depth_predictions['mask']
         assert depth.ndim == 2
+        assert target_depth.ndim == 3
+        assert target_depth.shape[0] == flow.shape[0]
         depthmap = torch.stack([depth, mask.to(depth.dtype)], dim=0)[None]
-        depth_token = self.depth_patch_embed(depthmap)
-        
-        # expand the edge size
-        depth_token = depth_token.expand(motion_token.shape[0], -1, -1, -1)
+        target_depthmap = torch.stack([target_depth, target_mask.to(target_depth.dtype)], dim=1)
+        all_depthmap = torch.cat((depthmap, target_depthmap), dim=0)
+        depth_token = self.depth_patch_embed(all_depthmap)
 
-        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,E,H,W,C]
+        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]  # [1,1+E,H,W,C]
 
         # multi-view transformer aggregation
         backbone_kwargs = {}
-        if camera_prior is not None:
-            assert camera_prior.shape == (motion_token.shape[0], 1, self.embed_dim)
-            backbone_kwargs["cam_token"] = camera_prior
+        if relative_pose_prior is not None:
+            prior_token = self.encode_relative_pose_prior(relative_pose_prior, relative_pose_prior_mask)
+            assert prior_token.shape == (flow.shape[0], 1, self.embed_dim)
+            reference_pose_prior = relative_pose_prior.new_zeros((1, 7))
+            reference_pose_prior[:, 6] = 1.0
+            reference_token = self.cam_enc(reference_pose_prior, self.backbone.pretrained.camera_token[:, :1, :])
+            backbone_kwargs["cam_token"] = torch.cat((reference_token, prior_token), dim=0)
         with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
-            feats, aux_feats = self.backbone(
+            feats, _ = self.backbone(
                 patch_token,
-                export_feat_layers=export_feat_layers,
+                export_feat_layers=[],
                 **backbone_kwargs,
             )
 
-        res_feat = self.res_depth_embed(depthmap)
         ht, wd = depth.shape[-2:]
         with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))  # 1,H,W
-            pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])  # 1,E,7, 1,E,2
+            pose_enc, pose_log_variance, relative_log_scale, scale_confidence = self.cam_dec(feats[-1][1][:, 1:])  # 1,E,7, 1,E,2
 
         output = {
-            "depth": depth.squeeze(0),  # H,W
-            "depth_conf": depth_conf.squeeze(0),  # H,W
             "pose_enc": pose_enc.squeeze(0),  # E,7
-            "pose_confidence": pose_log_variance.squeeze(0),  # E,2
             "pose_log_variance": pose_log_variance.squeeze(0),  # E,2
-            "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
-        }
-        
-        return output
-
-    def forward_from_motion_tokens(
-        self,
-        motion_token: torch.Tensor,
-        depth_predictions,
-        intrinsics: torch.Tensor,
-        export_feat_layers: list[int] | None = None,
-        use_fp16: bool = False,
-        decode_depth: bool = True,
-        camera_prior: torch.Tensor | None = None,
-    ):
-        """Run GeoNT from precomputed per-edge motion tokens.
-
-        Streaming inference stores motion tokens in the factor graph so
-        marginalization can finalize edges without re-running the flow frontend.
-        """
-        if export_feat_layers is None:
-            export_feat_layers = []
-
-        depth = depth_predictions["depth"]
-        mask = depth_predictions["mask"]
-        assert depth.ndim == 2
-        depthmap = torch.stack([depth, mask.to(depth.dtype)], dim=0)[None]
-        depth_token = self.depth_patch_embed(depthmap)
-        depth_token = depth_token.expand(motion_token.shape[0], -1, -1, -1)
-
-        patch_token = torch.cat((depth_token, motion_token), dim=-1)[None]
-
-        backbone_kwargs = {}
-        if camera_prior is not None:
-            assert camera_prior.shape == (motion_token.shape[0], 1, self.embed_dim)
-            backbone_kwargs["cam_token"] = camera_prior
-        with torch.autocast(device_type=patch_token.device.type, enabled=use_fp16 and patch_token.is_cuda):
-            feats, aux_feats = self.backbone(
-                patch_token,
-                export_feat_layers=export_feat_layers,
-                **backbone_kwargs,
-            )
-
-        ht, wd = depth.shape[-2:]
-        with torch.autocast(device_type=patch_token.device.type, enabled=False):
-            pose_enc, pose_log_variance = self.cam_dec(feats[-1][1])
-
-        output = {
-            "pose_enc": pose_enc.squeeze(0),
-            "pose_confidence": pose_log_variance.squeeze(0),
-            "aux": self._extract_auxiliary_features(aux_feats, export_feat_layers, ht, wd),
+            "relative_log_scale": relative_log_scale.squeeze(0),  # E
+            "scale_confidence": scale_confidence.squeeze(0),  # E
         }
         if decode_depth:
             res_feat = self.res_depth_embed(depthmap)
             with torch.autocast(device_type=patch_token.device.type, enabled=False):
-                depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))
-            output["depth"] = depth.squeeze(0)
-            output["depth_conf"] = depth_conf.squeeze(0)
+                depth, depth_conf = self.depth_head(feats, res_feat, img_shape=(ht, wd))  # 1,H,W
+            output["depth"] = depth.squeeze(0)  # H,W
+            output["depth_conf"] = depth_conf.squeeze(0)  # H,W
+        
         return output
 
-    def _extract_auxiliary_features(
-        self, feats: list[torch.Tensor], feat_layers: list[int], H: int, W: int
-    ) -> dict[str, torch.Tensor]:
-        """Extract auxiliary features from specified layers."""
-        aux_features = {}
-        assert len(feats) == len(feat_layers)
-        for feat, feat_layer in zip(feats, feat_layers):
-            # Reshape features to spatial dimensions
-            feat_reshaped = feat.reshape(
-                [
-                    feat.shape[0],
-                    feat.shape[1],
-                    H // self.patch_size,
-                    W // self.patch_size,
-                    feat.shape[-1],
-                ]
-            )
-            aux_features[f"feat_layer_{feat_layer}"] = feat_reshaped
-        
-        return aux_features
-    
-    @property
-    def num_out_layers(self):
-        return len(self.backbone.out_layers)
-    
-
 class GeoNTWrapper(nn.Module):
-    def __init__(self):
+    def __init__(self, model_config):
         super().__init__()
 
         self.flow = load_flow()
         self.mono = load_moge('v2')
-        self.gnt = GeoNT()
+        self.gnt = GeoNT(model_config)
 
-        self.freeze_model()
-
-    def freeze_model(self):
-        def _freeze_model(model):
-            model = model.eval()
-            for p in model.parameters():
-                p.requires_grad = False
-            for p in model.buffers():
-                p.requires_grad = False
-            return model
-        _freeze_model(self.mono)
+        self.mono.eval()
+        for p in self.mono.parameters():
+            p.requires_grad = False
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, Path, IO[bytes]], **hf_kwargs) -> 'GeoNTWrapper':
+    def from_pretrained(cls, pretrained_model_name_or_path: str | Path) -> "GeoNTWrapper":
         """
         Load a model from a checkpoint file.
 
         Args:
-            pretrained_model_name_or_path: path to the checkpoint file or repo id.
-            hf_kwargs: additional keyword arguments to pass to the huf_hub_download function. Ignored if pretrained_model_name_or_path is a local path.
+            pretrained_model_name_or_path: path to the checkpoint file.
 
         Returns:
             a new instance of 'GeoNTWrapper' with the parameters loaded from the checkpoint.
         """
         ckpt = torch.load(pretrained_model_name_or_path, map_location="cpu", weights_only=False)
-        model = cls()
-        model.load_state_dict(ckpt['model'], strict=True)
+        model = cls(ckpt["model_config"])
+        model.load_state_dict(ckpt["model"])
         return model
 
     def normalize_depth(self, depth, mask, eps=1e-8):
@@ -291,7 +237,7 @@ class GeoNTWrapper(nn.Module):
             scale[b] = mean
 
         valid_scale = scale > 0
-        if valid_scale.any():
+        if valid_scale.any().item():
             scale[~valid_scale] = scale[valid_scale].mean()
         else:
             scale[:] = 1.0
@@ -300,7 +246,7 @@ class GeoNTWrapper(nn.Module):
 
     def _frontend_forward(self, images, intrinsics, graph):
 
-        ii, jj, kk = graph_to_edge_list(graph)
+        ii, jj, _ = graph_to_edge_list(graph)
 
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
@@ -314,7 +260,7 @@ class GeoNTWrapper(nn.Module):
         depth_predictions = self.mono.infer(images[0], fov_x=fov_x)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
 
-        # Predict optical flow between graph edges
+        # Predict target-to-reference correspondence flow for each graph edge i -> j.
         mono_depths = mono_depths.clamp_min(0.01)
         disps = torch.zeros_like(mono_depths)
         disps[valid] = 1.0 / mono_depths[valid]
@@ -330,7 +276,7 @@ class GeoNTWrapper(nn.Module):
         fmap_8x = self.flow.fnet(images)
         mono_8x = self.flow.merge_head(mono)
         fmap_8x = torch.cat((fmap_8x, mono_8x), dim=1)
-        flow_predictions = self.flow.forward_with_fmap(fmap_8x[ii], fmap_8x[jj], bases[ii])
+        flow_predictions = self.flow.forward_with_fmap(fmap_8x[jj], fmap_8x[ii], bases[jj])
 
         flow_predictions = {
             "flow": [padder.unpad(x) for x in flow_predictions["flow"]],
@@ -341,153 +287,115 @@ class GeoNTWrapper(nn.Module):
 
         return flow_predictions, depth_predictions
 
-    def forward(self, images, intrinsics, graph, gt_depths, gt_depths_valid, gt_pose, use_fp16=False):
-
-        ii, jj, kk = graph_to_edge_list(graph)
+    def forward(
+        self,
+        images,
+        intrinsics,
+        graph,
+        gt_depth_valid,
+        pose_prior_args,
+        use_fp16=False,
+    ):
+        ii, jj, _ = graph_to_edge_list(graph)
+        iu_list = torch.unique(ii).tolist()
 
         ii = ii.to(device=images.device, dtype=torch.long)
         jj = jj.to(device=images.device, dtype=torch.long)
 
         images = images[:, :, [2,1,0]] / 255.0  # from BGR to RGB, in range [0, 1]
 
-        L = self.gnt.num_out_layers if self.training else 1
-        pose_graph = torch.zeros((ii.shape[0], 7), device=images.device, dtype=torch.float32)
-        pose_graph_log_variance = torch.zeros((ii.shape[0], 2), device=images.device, dtype=torch.float32)
+        # Edge measurement layout: 0:3 translation, 3:7 quaternion,
+        # 7:9 pose confidence/log variance, 9 relative log scale, 10 scale confidence.
+        edge_measurements = torch.zeros((ii.shape[0], 11), device=images.device, dtype=torch.float32)
+        edge_measurements[:, 10] = 1.0
         depths = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
         depths_conf = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
-
-        # ====
-        # gt_pose = SE3(gt_pose).inv()  # convert poses w2c -> c2w
-        # coords0, val0 = projective_transform(gt_pose, 1.0 / gt_depths, intrinsics, ii, jj)
-        # H, W = coords0.shape[2:4]
-        # v, u = torch.meshgrid(
-        #     torch.arange(H, device=coords0.device, dtype=torch.float),
-        #     torch.arange(W, device=coords0.device, dtype=torch.float),
-        #     indexing="ij",
-        # )
-        # flow_final = (coords0 - torch.stack((u, v), dim=-1))[0].permute(0, 3, 1, 2)
-        # info = (val0.squeeze(-1) * gt_depths_valid[:, ii].float())[0]
-
-        # error = torch.norm(flow_final_est - flow_final, dim=1, keepdim=False)
-        # flow_norm = torch.norm(flow_final, dim=1, keepdim=False)
-        # info_ = info * info_est
-        # print("error", error[1, 200:210, 200:210], flow_norm[1, 200:210, 200:210], flow_final_est[1, 0, 200:210, 200:210])
-        # print("info", info_[1, 200:210, 200:210])
 
         # Front end
         flow_predictions, depth_predictions = self._frontend_forward(images, intrinsics, graph)
         mono_depths, valid = depth_predictions["depth"], depth_predictions["mask"]
-        scaled_depth, scale = self.normalize_depth(mono_depths, valid)
+        # mono_depths/valid: [S,H,W]; gt_depth_valid: [1,S,H,W].
+        # train_depth_valid is the shared MoGe/GT mask used for the input depth gauge.
+        train_depth_valid = valid & gt_depth_valid[0]
+        # scaled_depth: [S,H,W] with valid-mask mean 1 per frame; scale: [S].
+        scaled_depth, scale = self.normalize_depth(mono_depths, train_depth_valid)
 
         flow_final, info_final = flow_predictions["flow"][-1], flow_predictions["info"][-1]
 
-        iu = torch.unique(ii)
-        for fi in iu:
+        train_prob = pose_prior_args.pose_prior_train_prob
+        pose_prior_selected_list = (torch.rand(len(iu_list)) < train_prob).tolist()
+        if train_prob > 0.0 and not any(pose_prior_selected_list):
+            pose_prior_selected_list[int(torch.randint(len(iu_list), (1,)).item())] = True
+
+        for group_idx, fi in enumerate(iu_list):
             torch.cuda.empty_cache()
-            # collect edges connected to the keyframe
+            # mask: [E], selecting E_i outgoing edges for source frame fi.
             mask = (ii == fi)
-            flow_input = {
-                "final": flow_final[mask],
+            group_flow_predictions = {
+                "final": flow_final[mask],  # [E_i,2,H,W]
                 "info": info_final[mask],
                 "var_min": self.flow.args.var_min,
                 "var_max": self.flow.args.var_max,
             }
             depth_input = {
-                "depth": scaled_depth[fi],
-                "mask": valid[fi],
+                "depth": scaled_depth[fi],  # [H,W]
+                "mask": train_depth_valid[fi],  # [H,W]
+            }
+            target_scale_ratio = scale[jj[mask]] / scale[fi]
+            target_depth = scaled_depth[jj[mask]] * target_scale_ratio[:, None, None]
+            target_depth_input = {
+                "depth": target_depth,  # [E_i,H,W], normalized in source/reference gauge.
+                "mask": train_depth_valid[jj[mask]],  # [E_i,H,W]
             }
 
-            output_geo = self.gnt(
-                flow_input,
-                depth_input,
-                intrinsics[0, fi],
-                export_feat_layers=[],
-                use_fp16=use_fp16,
-            )
+            if pose_prior_selected_list[group_idx]:
+                with torch.no_grad():
+                    first_output = self.gnt(
+                        group_flow_predictions,
+                        depth_input,
+                        source_intrinsics=intrinsics[0, fi],
+                        target_intrinsics=intrinsics[0, jj[mask]],
+                        target_depth_predictions=target_depth_input,
+                        use_fp16=use_fp16,
+                        decode_depth=False,
+                    )
+                relative_pose_prior = first_output["pose_enc"].detach()
+                output_geo = self.gnt(
+                    group_flow_predictions,
+                    depth_input,
+                    source_intrinsics=intrinsics[0, fi],
+                    target_intrinsics=intrinsics[0, jj[mask]],
+                    target_depth_predictions=target_depth_input,
+                    use_fp16=use_fp16,
+                    decode_depth=True,
+                    relative_pose_prior=relative_pose_prior,
+                )
+            else:
+                output_geo = self.gnt(
+                    group_flow_predictions,
+                    depth_input,
+                    source_intrinsics=intrinsics[0, fi],
+                    target_intrinsics=intrinsics[0, jj[mask]],
+                    target_depth_predictions=target_depth_input,
+                    use_fp16=use_fp16,
+                    decode_depth=True,
+                )
 
             depths[fi] = output_geo["depth"]
             depths_conf[fi] = output_geo["depth_conf"]
-            pose_graph[mask] = output_geo["pose_enc"]
-            pose_graph_log_variance[mask] = output_geo["pose_log_variance"]
+            edge_measurements[mask, :7] = output_geo["pose_enc"]
+            edge_measurements[mask, 7:9] = output_geo["pose_log_variance"]
+            edge_measurements[mask, 9] = output_geo["relative_log_scale"]
+            edge_measurements[mask, 10] = output_geo["scale_confidence"]
 
         predictions = {
-            "pose_graph": pose_graph[None],  # 1,E,7
-            "pose_graph_log_variance": pose_graph_log_variance[None],  # 1,E,2
+            "edge_measurements": edge_measurements[None],  # 1,E,11
             "depth": depths[None],  # 1,S,H,W
             "depth_conf": depths_conf[None],  # 1,S,H,W
-            "valid": valid[None],
+            "valid": train_depth_valid[None],  # 1,S,H,W
             "scale": scale[None],  # (B,S)
             "flow_predictions": flow_predictions,
             "mono_depth": mono_depths[None],  # 1,S,H,W
         }
 
         return predictions
-
-    def encode_features(self, images: torch.Tensor, intrinsics: torch.Tensor):
-        """
-        image (torch.Tensor): BCHW image RGB 0-1
-        intrinsics (torch.Tensor): B4
-        """
-        B, _, H, W = images.shape
-        # Monocular depth prior
-        fx = intrinsics[:, 0]
-        fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
-        depth_predictions = self.mono.infer(images, fov_x=fov_x)
-        mono_depths, mono_feats, valid = depth_predictions["depth"], depth_predictions["feature"], depth_predictions["mask"]
-        
-        images = 2 * images - 1.0
-        fmap_8x = self.flow.fnet(images)
-        mono_8x = self.flow.merge_head(mono_feats)
-        fmap_8x = torch.cat((fmap_8x, mono_8x), dim=1)
-
-        return fmap_8x, mono_depths, valid
-    
-    def encode_bases(self, depths: torch.Tensor, valid: torch.Tensor):
-        """
-        depths (torch.Tensor): BHW depth estimation
-        valid (torch.Tensor): BHW valid mask, boolean
-        """
-        depths = depths.clamp_min(0.01)
-        disps = torch.zeros_like(depths)
-        disps[valid] = 1.0 / depths[valid]
-        bases = self.flow.create_bases(disps.unsqueeze(1))
-        return self.flow.init_decoder.patch_embed_base(bases)
-
-    def flow_init(self, fmap1_8x, fmap2_8x, bases):
-        idx_bins = torch.linspace(-16, 16, self.flow.n_bins, device=fmap1_8x.device, dtype=fmap1_8x.dtype).view(1, self.flow.n_bins, 1, 1)
-
-        x = self.flow.init_proj(torch.cat([fmap1_8x, fmap2_8x], dim=1))
-        x, net = self.flow.init_decoder.forward_with_bases(x, bases)
-        init_bins = self.flow.init_bin_head(x)
-        init_mask = .25 * self.flow.init_mask_head(x)
-
-        flow_8x = self.flow.init_pred(init_bins, idx_bins)
-        init_flow = self.flow.upsample_flow(flow_8x, init_mask) / 8.0
-        net = self.flow.net_init(net)
-
-        return init_flow, net
-    
-    def encode_flow(self, fmap1_8x, fmap2_8x, bases, intrinsics):
-        flow, info = self.flow.infer(fmap1_8x, fmap2_8x, bases)
-        motion_token = self.gnt.motion_patch_embed(flow, info, intrinsics, var_min=self.flow.args.var_min, var_max=self.flow.args.var_max)
-        return motion_token
-
-    def refine_from_motion_tokens(
-        self,
-        motion_token: torch.Tensor,
-        depth: torch.Tensor,
-        mask: torch.Tensor,
-        intrinsics: torch.Tensor,
-        use_fp16: bool = False,
-        decode_depth: bool = True,
-        camera_prior: torch.Tensor | None = None,
-    ):
-        return self.gnt.forward_from_motion_tokens(
-            motion_token,
-            {"depth": depth, "mask": mask},
-            intrinsics,
-            export_feat_layers=[],
-            use_fp16=use_fp16,
-            decode_depth=decode_depth,
-            camera_prior=camera_prior,
-        )

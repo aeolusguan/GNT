@@ -1,0 +1,51 @@
+Weights:
+  DA3: './weights/model.safetensors'
+  DA3_CONFIG: './weights/config.json'
+  SALAD: './weights/dino_salad.ckpt'
+
+Model:
+  chunk_size: 120
+  overlap: 60
+  loop_chunk_size: 20
+  loop_enable: False
+  useDBoW: False
+  delete_temp_files: True
+  align_lib: 'torch'
+  align_method: 'sim3'
+  scale_compute_method: 'auto'
+  align_type: 'dense'
+
+  ref_view_strategy: 'saddle_balanced'
+  ref_view_strategy_loop: 'saddle_balanced'
+  depth_threshold: 15.0
+
+  save_depth_conf_result: True
+  save_camera_pose_result: False
+  save_debug_info: False
+
+  Sparse_Align:
+    keypoint_select: 'orb'
+    keypoint_num: 5000
+
+  IRLS:
+    delta: 0.1
+    max_iters: 5
+    tol: 1e-9
+
+  Pointcloud_Save:
+    sample_ratio: 0.015
+    conf_threshold_coef: 0.75
+
+Loop:
+  SALAD:
+    image_size: [336, 336]
+    batch_size: 32
+    similarity_threshold: 0.85
+    top_k: 5
+    use_nms: True
+    nms_threshold: 25
+
+  SIM3_Optimizer:
+    lang_version: 'python'
+    max_iterations: 30
+    lambda_init: 1e-6

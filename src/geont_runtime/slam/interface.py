@@ -41,13 +41,13 @@ class SLAMOutput:
     intrinsics: torch.Tensor  # (4,)
 
     log_scales: torch.Tensor | None = None
+    moge_log_scales: torch.Tensor | None = None
     depths: torch.Tensor | None = None  # (N, 1, H, W), keyframe-aligned
     depth_masks: torch.Tensor | None = None  # (N, 1, H, W), keyframe-aligned
     depth_status: torch.Tensor | None = None  # 0 empty, 1 mono, 2 refined
     depth_dirty: torch.Tensor | None = None  # keyframe-aligned dirty depth flags
     pose_edges: dict[str, torch.Tensor] | None = None
     pgo_info: dict | None = None
-    pgo_replay: dict[str, torch.Tensor] | None = None
     slam_map: SLAMMap | None = None
     timestamps: np.ndarray | None = None
     frame_trajectory: SE3 | None = None
@@ -58,6 +58,12 @@ class SLAMOutput:
         if self.log_scales is None:
             return None
         return torch.exp(self.log_scales)
+
+    @property
+    def moge_scales(self) -> torch.Tensor | None:
+        if self.moge_log_scales is None:
+            return None
+        return torch.exp(self.moge_log_scales)
 
     @property
     def keyframe_ids(self) -> np.ndarray:

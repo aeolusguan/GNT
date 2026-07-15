@@ -15,6 +15,7 @@ constexpr float EPS = 1.0e-8f;
 #define CHECK_CUDA(x) TORCH_CHECK(x.is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_FLOAT(x) TORCH_CHECK(x.scalar_type() == at::kFloat, #x " must be float32")
 #define CHECK_LONG(x) TORCH_CHECK(x.scalar_type() == at::kLong, #x " must be int64")
+#define CHECK_INT(x) TORCH_CHECK(x.scalar_type() == at::kInt, #x " must be int32")
 #define CHECK_CONTIGUOUS(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
 
 void check_edge_index_tensors(const torch::Tensor& ii, const torch::Tensor& jj, int64_t n_edges) {
@@ -43,18 +44,6 @@ void check_weights(const torch::Tensor& sqrt_info, const torch::Tensor& robust, 
 
 __device__ inline float clamp_scale(float value) {
     return value < EPS ? EPS : value;
-}
-
-__device__ inline void atomic_max_float(float* address, float value) {
-    int* address_as_int = reinterpret_cast<int*>(address);
-    int old = *address_as_int;
-    while (value > __int_as_float(old)) {
-        const int assumed = old;
-        old = atomicCAS(address_as_int, assumed, __float_as_int(value));
-        if (old == assumed) {
-            break;
-        }
-    }
 }
 
 __device__ inline void load_quat(const float* data, float q[4]) {
@@ -325,200 +314,6 @@ __device__ inline void rotation_residual_from_quats(
     quat_log(err, residual);
 }
 
-__global__ void se3_scale_apply_delta_kernel(
-    const float* poses,
-    const float* log_s,
-    const float* step_full,
-    int anchor,
-    int n_nodes,
-    float* candidate_poses,
-    float* candidate_log_s) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= n_nodes) {
-        return;
-    }
-
-    const float* pose = poses + idx * 7;
-    const float* step = step_full + idx * 7;
-    float* candidate_pose = candidate_poses + idx * 7;
-    candidate_log_s[idx] = log_s[idx] + step[6];
-
-    if (idx == anchor) {
-        for (int k = 0; k < 7; ++k) {
-            candidate_pose[k] = pose[k];
-        }
-        return;
-    }
-
-    float q_current[4];
-    load_quat(pose + 3, q_current);
-    float rotated_dt[3];
-    const float dt[3] = {step[0], step[1], step[2]};
-    quat_rotate(q_current, dt, rotated_dt);
-    candidate_pose[0] = pose[0] + rotated_dt[0];
-    candidate_pose[1] = pose[1] + rotated_dt[1];
-    candidate_pose[2] = pose[2] + rotated_dt[2];
-
-    const float dphi[3] = {step[3], step[4], step[5]};
-    float q_delta[4];
-    so3_exp_quat(dphi, q_delta);
-    float q_new[4];
-    quat_mul(q_current, q_delta, q_new);
-    normalize_quat(q_new);
-    candidate_pose[3] = q_new[0];
-    candidate_pose[4] = q_new[1];
-    candidate_pose[5] = q_new[2];
-    candidate_pose[6] = q_new[3];
-}
-
-__global__ void se3_scale_candidate_summary_kernel(
-    const float* candidate_poses,
-    const float* candidate_log_s,
-    const float* step_full,
-    const float* rel_poses,
-    const float* prior_log_s,
-    const int64_t* ii,
-    const int64_t* jj,
-    const float* sqrt_info,
-    const float* robust,
-    float scale_prior_diag,
-    int n_nodes,
-    int n_edges,
-    float* summary) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n_edges) {
-        const int i = static_cast<int>(ii[idx]);
-        const int j = static_cast<int>(jj[idx]);
-        const float* pose_i = candidate_poses + i * 7;
-        const float* pose_j = candidate_poses + j * 7;
-        const float* rel_pose = rel_poses + idx * 7;
-
-        float pred_metric[3];
-        float pred_q[4];
-        float R_i[9];
-        float R_j[9];
-        float source_t_in_source[3];
-        relative_pose(pose_i, pose_j, pred_metric, pred_q, R_i, R_j, source_t_in_source);
-        const float inv_source_scale = 1.0f / clamp_scale(expf(candidate_log_s[i]));
-
-        float rel_q[4];
-        float rel_q_inv[4];
-        load_quat(rel_pose + 3, rel_q);
-        quat_inv(rel_q, rel_q_inv);
-        float rot_err_q[4];
-        quat_mul(rel_q_inv, pred_q, rot_err_q);
-        float rot_residual[3];
-        quat_log(rot_err_q, rot_residual);
-
-        const float residual[6] = {
-            pred_metric[0] * inv_source_scale - rel_pose[0],
-            pred_metric[1] * inv_source_scale - rel_pose[1],
-            pred_metric[2] * inv_source_scale - rel_pose[2],
-            rot_residual[0],
-            rot_residual[1],
-            rot_residual[2],
-        };
-
-        const float robust_e = robust[idx];
-        float edge_cost = 0.0f;
-        for (int r = 0; r < 6; ++r) {
-            const float weighted = residual[r] * sqrt_info[idx * 6 + r] * robust_e;
-            edge_cost += weighted * weighted;
-        }
-        atomicAdd(summary, 0.5f * edge_cost);
-    }
-
-    if (idx < n_nodes) {
-        const float prior = candidate_log_s[idx] - prior_log_s[idx];
-        atomicAdd(summary, 0.5f * prior * prior * scale_prior_diag);
-
-        float step_sq = 0.0f;
-        const float* step = step_full + idx * 7;
-        for (int k = 0; k < 7; ++k) {
-            step_sq += step[k] * step[k];
-        }
-        atomicAdd(summary + 1, step_sq);
-    }
-}
-
-__global__ void se3_scale_stats_kernel(
-    const float* poses,
-    const float* log_s,
-    const float* rel_poses,
-    const float* prior_log_s,
-    const int64_t* ii,
-    const int64_t* jj,
-    const float* sqrt_info,
-    float scale_prior_diag,
-    int n_nodes,
-    int n_edges,
-    float* summary) {
-    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n_edges) {
-        const int i = static_cast<int>(ii[idx]);
-        const int j = static_cast<int>(jj[idx]);
-        const float* pose_i = poses + i * 7;
-        const float* pose_j = poses + j * 7;
-        const float* rel_pose = rel_poses + idx * 7;
-
-        float pred_metric[3];
-        float pred_q[4];
-        float R_i[9];
-        float R_j[9];
-        float source_t_in_source[3];
-        relative_pose(pose_i, pose_j, pred_metric, pred_q, R_i, R_j, source_t_in_source);
-        const float inv_source_scale = 1.0f / clamp_scale(expf(log_s[i]));
-
-        float rel_q[4];
-        float rel_q_inv[4];
-        load_quat(rel_pose + 3, rel_q);
-        quat_inv(rel_q, rel_q_inv);
-        float rot_err_q[4];
-        quat_mul(rel_q_inv, pred_q, rot_err_q);
-        float rot_residual[3];
-        quat_log(rot_err_q, rot_residual);
-
-        const float residual[6] = {
-            pred_metric[0] * inv_source_scale - rel_pose[0],
-            pred_metric[1] * inv_source_scale - rel_pose[1],
-            pred_metric[2] * inv_source_scale - rel_pose[2],
-            rot_residual[0],
-            rot_residual[1],
-            rot_residual[2],
-        };
-
-        float weighted_sq = 0.0f;
-        bool finite = true;
-        for (int r = 0; r < 6; ++r) {
-            const float weighted = residual[r] * sqrt_info[idx * 6 + r];
-            weighted_sq += weighted * weighted;
-            finite = finite && isfinite(weighted);
-        }
-        const float edge_norm = sqrtf(weighted_sq);
-        finite = finite && isfinite(edge_norm);
-        if (finite) {
-            atomicAdd(summary, 0.5f * weighted_sq);
-            atomicAdd(summary + 1, edge_norm);
-            atomic_max_float(summary + 2, edge_norm);
-        } else {
-            atomicAdd(summary + 5, 1.0f);
-        }
-    }
-
-    if (idx < n_nodes) {
-        const float scale_sqrt_info = sqrtf(scale_prior_diag);
-        const float prior = (log_s[idx] - prior_log_s[idx]) * scale_sqrt_info;
-        if (isfinite(prior)) {
-            const float prior_abs = fabsf(prior);
-            atomicAdd(summary, 0.5f * prior * prior);
-            atomicAdd(summary + 3, prior_abs);
-            atomic_max_float(summary + 4, prior_abs);
-        } else {
-            atomicAdd(summary + 5, 1.0f);
-        }
-    }
-}
-
 __global__ void rotation_blocks_kernel(
     const float* rotations,
     const float* meas_rotations,
@@ -559,18 +354,14 @@ __global__ void translation_scale_blocks_kernel(
     const float* poses,
     const float* log_s,
     const float* rel_poses,
-    const float* prior_log_s,
     const int64_t* ii,
     const int64_t* jj,
     const float* sqrt_info,
     const float* robust,
-    float scale_prior_diag,
-    int n_nodes,
     int n_edges,
     float* source_block,
     float* target_block,
-    float* edge_residual,
-    float* prior_gradient) {
+    float* edge_residual) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n_edges) {
         const int i = static_cast<int>(ii[idx]);
@@ -599,27 +390,20 @@ __global__ void translation_scale_blocks_kernel(
             source_block[idx * 12 + r * 4 + 3] = -pred_t * weight;
         }
     }
-    if (idx < n_nodes) {
-        prior_gradient[idx] = (log_s[idx] - prior_log_s[idx]) * scale_prior_diag;
-    }
 }
 
 __global__ void se3_scale_blocks_kernel(
     const float* poses,
     const float* log_s,
     const float* rel_poses,
-    const float* prior_log_s,
     const int64_t* ii,
     const int64_t* jj,
     const float* sqrt_info,
     const float* robust,
-    float scale_prior_diag,
-    int n_nodes,
     int n_edges,
     float* source_block,
     float* target_block,
-    float* edge_residual,
-    float* prior_gradient) {
+    float* edge_residual) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < n_edges) {
         const int i = static_cast<int>(ii[idx]);
@@ -697,27 +481,22 @@ __global__ void se3_scale_blocks_kernel(
             }
         }
     }
-    if (idx < n_nodes) {
-        prior_gradient[idx] = (log_s[idx] - prior_log_s[idx]) * scale_prior_diag;
-    }
 }
 
 __global__ void se3_scale_weighted_blocks_kernel(
     const float* poses,
     const float* log_s,
     const float* rel_poses,
-    const float* prior_log_s,
+    const float* rel_log_scales,
     const int64_t* ii,
     const int64_t* jj,
     const float* sqrt_info,
+    const float* scale_sqrt_info,
     float huber_delta,
-    float scale_prior_diag,
-    int n_nodes,
     int n_edges,
     float* source_block,
     float* target_block,
     float* edge_residual,
-    float* prior_gradient,
     float* robust,
     float* summary) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -772,9 +551,9 @@ __global__ void se3_scale_weighted_blocks_kernel(
         atomicAdd(summary + 1, 0.5f * unrobust_sq);
         atomicAdd(summary, 0.5f * unrobust_sq * robust_e * robust_e);
 
-        for (int k = 0; k < 42; ++k) {
-            source_block[idx * 42 + k] = 0.0f;
-            target_block[idx * 42 + k] = 0.0f;
+        for (int k = 0; k < 49; ++k) {
+            source_block[idx * 49 + k] = 0.0f;
+            target_block[idx * 49 + k] = 0.0f;
         }
 
         float source_hat[9];
@@ -788,35 +567,116 @@ __global__ void se3_scale_weighted_blocks_kernel(
 
         for (int r = 0; r < 6; ++r) {
             const float weight = sqrt_info[idx * 6 + r] * robust_e;
-            edge_residual[idx * 6 + r] = residual[r] * weight;
+            edge_residual[idx * 7 + r] = residual[r] * weight;
             if (r < 3) {
                 for (int c = 0; c < 3; ++c) {
                     const float translation_value = R_j[3 * r + c] * inv_source_scale * weight;
-                    source_block[idx * 42 + r * 7 + c] = -translation_value;
-                    target_block[idx * 42 + r * 7 + c] = translation_value;
+                    source_block[idx * 49 + r * 7 + c] = -translation_value;
+                    target_block[idx * 49 + r * 7 + c] = translation_value;
 
                     const float rotation_value = trans_rot_block[3 * r + c] * inv_source_scale * weight;
-                    source_block[idx * 42 + r * 7 + 3 + c] = -rotation_value;
-                    target_block[idx * 42 + r * 7 + 3 + c] = rotation_value;
+                    source_block[idx * 49 + r * 7 + 3 + c] = -rotation_value;
+                    target_block[idx * 49 + r * 7 + 3 + c] = rotation_value;
                 }
-                source_block[idx * 42 + r * 7 + 6] = -pred_t[r] * weight;
+                source_block[idx * 49 + r * 7 + 6] = -pred_t[r] * weight;
             } else {
                 const int rr = r - 3;
                 for (int c = 0; c < 3; ++c) {
                     const float value = rotation_block[3 * rr + c] * weight;
-                    source_block[idx * 42 + r * 7 + 3 + c] = -value;
-                    target_block[idx * 42 + r * 7 + 3 + c] = value;
+                    source_block[idx * 49 + r * 7 + 3 + c] = -value;
+                    target_block[idx * 49 + r * 7 + 3 + c] = value;
                 }
             }
         }
+        const float scale_weight = scale_sqrt_info[idx];
+        source_block[idx * 49 + 48] = -scale_weight;
+        target_block[idx * 49 + 48] = scale_weight;
+        const float scale_residual =
+            (log_s[j] - log_s[i] - rel_log_scales[idx]) * scale_weight;
+        edge_residual[idx * 7 + 6] = scale_residual;
     }
-    if (idx < n_nodes) {
-        const float prior = log_s[idx] - prior_log_s[idx];
-        prior_gradient[idx] = prior * scale_prior_diag;
-        const float prior_cost = 0.5f * prior * prior * scale_prior_diag;
-        atomicAdd(summary, prior_cost);
-        atomicAdd(summary + 1, prior_cost);
+}
+
+__device__ inline double se3_scale_column_dot(
+    const float* block_a,
+    const float* block_b,
+    int col_a,
+    int col_b,
+    int residual_mask) {
+    double value = 0.0;
+    for (int row = 0; row < 7; ++row) {
+        if ((residual_mask & (1 << row)) != 0) {
+            const double product = __dmul_rn(
+                static_cast<double>(block_a[row * 7 + col_a]),
+                static_cast<double>(block_b[row * 7 + col_b]));
+            value = __dadd_rn(value, product);
+        }
     }
+    return value;
+}
+
+__global__ void se3_scale_hessian_values_kernel(
+    const float* source_block,
+    const float* target_block,
+    const int* group_offsets,
+    const int64_t* metadata,
+    int n_values,
+    double* values) {
+    const int value_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (value_index >= n_values) {
+        return;
+    }
+    double value = 0.0;
+    for (int slot = group_offsets[value_index]; slot < group_offsets[value_index + 1]; ++slot) {
+        const uint64_t item = static_cast<uint64_t>(metadata[slot]);
+        const int edge = static_cast<int>(item & 0xffffffffu);
+        const int block_a_kind = static_cast<int>((item >> 32) & 1u);
+        const int block_b_kind = static_cast<int>((item >> 33) & 1u);
+        const int col_a = static_cast<int>((item >> 34) & 7u);
+        const int col_b = static_cast<int>((item >> 37) & 7u);
+        const int residual_mask = static_cast<int>((item >> 40) & 0x7fu);
+        const float* block_a = (block_a_kind == 0 ? source_block : target_block) + edge * 49;
+        const float* block_b = (block_b_kind == 0 ? source_block : target_block) + edge * 49;
+        value = __dadd_rn(
+            value,
+            se3_scale_column_dot(block_a, block_b, col_a, col_b, residual_mask));
+    }
+    values[value_index] = value;
+}
+
+__global__ void se3_scale_gradient_kernel(
+    const float* source_block,
+    const float* target_block,
+    const float* edge_residual,
+    const int* group_offsets,
+    const int64_t* metadata,
+    int n_variables,
+    double* gradient) {
+    const int variable = blockIdx.x * blockDim.x + threadIdx.x;
+    if (variable >= n_variables) {
+        return;
+    }
+    double value = 0.0;
+    for (int slot = group_offsets[variable]; slot < group_offsets[variable + 1]; ++slot) {
+        const uint64_t item = static_cast<uint64_t>(metadata[slot]);
+        const int edge = static_cast<int>(item & 0xffffffffu);
+        const int block_kind = static_cast<int>((item >> 32) & 1u);
+        const float* block = (block_kind == 0 ? source_block : target_block) + edge * 49;
+        const float* residual = edge_residual + edge * 7;
+        const int col = static_cast<int>((item >> 33) & 7u);
+        const int residual_mask = static_cast<int>((item >> 36) & 0x7fu);
+        double contribution = 0.0;
+        for (int row = 0; row < 7; ++row) {
+            if ((residual_mask & (1 << row)) != 0) {
+                const double product = __dmul_rn(
+                    static_cast<double>(block[row * 7 + col]),
+                    static_cast<double>(residual[row]));
+                contribution = __dadd_rn(contribution, product);
+            }
+        }
+        value = __dadd_rn(value, contribution);
+    }
+    gradient[variable] = value;
 }
 
 }  // namespace
@@ -863,33 +723,26 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> rotation_blocks_cuda(
     return {source_block, target_block, edge_residual};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> translation_scale_blocks_cuda(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> translation_scale_blocks_cuda(
     torch::Tensor poses,
     torch::Tensor log_s,
     torch::Tensor rel_poses,
-    torch::Tensor prior_log_s,
     torch::Tensor ii,
     torch::Tensor jj,
     torch::Tensor sqrt_info,
-    torch::Tensor robust,
-    double scale_prior_diag) {
+    torch::Tensor robust) {
     CHECK_CUDA(poses);
     CHECK_CUDA(log_s);
     CHECK_CUDA(rel_poses);
-    CHECK_CUDA(prior_log_s);
     CHECK_FLOAT(poses);
     CHECK_FLOAT(log_s);
     CHECK_FLOAT(rel_poses);
-    CHECK_FLOAT(prior_log_s);
     CHECK_CONTIGUOUS(poses);
     CHECK_CONTIGUOUS(log_s);
     CHECK_CONTIGUOUS(rel_poses);
-    CHECK_CONTIGUOUS(prior_log_s);
     TORCH_CHECK(poses.dim() == 2 && poses.size(1) == 7, "poses must have shape (N, 7)");
     TORCH_CHECK(log_s.dim() == 1 && log_s.numel() == poses.size(0), "log_s must have shape (N,)");
-    TORCH_CHECK(prior_log_s.dim() == 1 && prior_log_s.numel() == poses.size(0), "prior_log_s must have shape (N,)");
     TORCH_CHECK(rel_poses.dim() == 2 && rel_poses.size(1) == 7, "rel_poses must have shape (E, 7)");
-    const int64_t n_nodes64 = poses.size(0);
     const int64_t n_edges64 = rel_poses.size(0);
     check_edge_index_tensors(ii, jj, n_edges64);
     check_weights(sqrt_info, robust, n_edges64, 3);
@@ -898,58 +751,45 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> translati
     auto source_block = torch::empty({n_edges64, 3, 4}, poses.options());
     auto target_block = torch::empty({n_edges64, 3, 4}, poses.options());
     auto edge_residual = torch::empty({n_edges64, 3}, poses.options());
-    auto prior_gradient = torch::empty({n_nodes64}, poses.options());
-    const int total = static_cast<int>(std::max(n_nodes64, n_edges64));
-    if (total > 0) {
-        const int blocks = (total + THREADS - 1) / THREADS;
+    if (n_edges64 > 0) {
+        const int blocks = (n_edges64 + THREADS - 1) / THREADS;
         translation_scale_blocks_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
             poses.data_ptr<float>(),
             log_s.data_ptr<float>(),
             rel_poses.data_ptr<float>(),
-            prior_log_s.data_ptr<float>(),
             ii.data_ptr<int64_t>(),
             jj.data_ptr<int64_t>(),
             sqrt_info.data_ptr<float>(),
             robust.data_ptr<float>(),
-            static_cast<float>(scale_prior_diag),
-            static_cast<int>(n_nodes64),
             static_cast<int>(n_edges64),
             source_block.data_ptr<float>(),
             target_block.data_ptr<float>(),
-            edge_residual.data_ptr<float>(),
-            prior_gradient.data_ptr<float>());
+            edge_residual.data_ptr<float>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    return {source_block, target_block, edge_residual, prior_gradient};
+    return {source_block, target_block, edge_residual};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> se3_scale_blocks_cuda(
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> se3_scale_blocks_cuda(
     torch::Tensor poses,
     torch::Tensor log_s,
     torch::Tensor rel_poses,
-    torch::Tensor prior_log_s,
     torch::Tensor ii,
     torch::Tensor jj,
     torch::Tensor sqrt_info,
-    torch::Tensor robust,
-    double scale_prior_diag) {
+    torch::Tensor robust) {
     CHECK_CUDA(poses);
     CHECK_CUDA(log_s);
     CHECK_CUDA(rel_poses);
-    CHECK_CUDA(prior_log_s);
     CHECK_FLOAT(poses);
     CHECK_FLOAT(log_s);
     CHECK_FLOAT(rel_poses);
-    CHECK_FLOAT(prior_log_s);
     CHECK_CONTIGUOUS(poses);
     CHECK_CONTIGUOUS(log_s);
     CHECK_CONTIGUOUS(rel_poses);
-    CHECK_CONTIGUOUS(prior_log_s);
     TORCH_CHECK(poses.dim() == 2 && poses.size(1) == 7, "poses must have shape (N, 7)");
     TORCH_CHECK(log_s.dim() == 1 && log_s.numel() == poses.size(0), "log_s must have shape (N,)");
-    TORCH_CHECK(prior_log_s.dim() == 1 && prior_log_s.numel() == poses.size(0), "prior_log_s must have shape (N,)");
     TORCH_CHECK(rel_poses.dim() == 2 && rel_poses.size(1) == 7, "rel_poses must have shape (E, 7)");
-    const int64_t n_nodes64 = poses.size(0);
     const int64_t n_edges64 = rel_poses.size(0);
     check_edge_index_tensors(ii, jj, n_edges64);
     check_weights(sqrt_info, robust, n_edges64, 6);
@@ -958,261 +798,194 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> se3_scale
     auto source_block = torch::empty({n_edges64, 6, 7}, poses.options());
     auto target_block = torch::empty({n_edges64, 6, 7}, poses.options());
     auto edge_residual = torch::empty({n_edges64, 6}, poses.options());
-    auto prior_gradient = torch::empty({n_nodes64}, poses.options());
-    const int total = static_cast<int>(std::max(n_nodes64, n_edges64));
-    if (total > 0) {
-        const int blocks = (total + THREADS - 1) / THREADS;
+    if (n_edges64 > 0) {
+        const int blocks = (n_edges64 + THREADS - 1) / THREADS;
         se3_scale_blocks_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
             poses.data_ptr<float>(),
             log_s.data_ptr<float>(),
             rel_poses.data_ptr<float>(),
-            prior_log_s.data_ptr<float>(),
             ii.data_ptr<int64_t>(),
             jj.data_ptr<int64_t>(),
             sqrt_info.data_ptr<float>(),
             robust.data_ptr<float>(),
-            static_cast<float>(scale_prior_diag),
-            static_cast<int>(n_nodes64),
             static_cast<int>(n_edges64),
             source_block.data_ptr<float>(),
             target_block.data_ptr<float>(),
-            edge_residual.data_ptr<float>(),
-            prior_gradient.data_ptr<float>());
+            edge_residual.data_ptr<float>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    return {source_block, target_block, edge_residual, prior_gradient};
+    return {source_block, target_block, edge_residual};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, double, double>
-se3_scale_weighted_blocks_cuda(
+void se3_scale_weighted_blocks_cuda(
     torch::Tensor poses,
     torch::Tensor log_s,
     torch::Tensor rel_poses,
-    torch::Tensor prior_log_s,
+    torch::Tensor rel_log_scales,
     torch::Tensor ii,
     torch::Tensor jj,
     torch::Tensor sqrt_info,
+    torch::Tensor scale_sqrt_info,
     double huber_delta,
-    double scale_prior_diag) {
+    torch::Tensor source_block,
+    torch::Tensor target_block,
+    torch::Tensor edge_residual,
+    torch::Tensor robust,
+    torch::Tensor summary) {
     CHECK_CUDA(poses);
     CHECK_CUDA(log_s);
     CHECK_CUDA(rel_poses);
-    CHECK_CUDA(prior_log_s);
+    CHECK_CUDA(rel_log_scales);
     CHECK_FLOAT(poses);
     CHECK_FLOAT(log_s);
     CHECK_FLOAT(rel_poses);
-    CHECK_FLOAT(prior_log_s);
+    CHECK_FLOAT(rel_log_scales);
     CHECK_CONTIGUOUS(poses);
     CHECK_CONTIGUOUS(log_s);
     CHECK_CONTIGUOUS(rel_poses);
-    CHECK_CONTIGUOUS(prior_log_s);
+    CHECK_CONTIGUOUS(rel_log_scales);
     TORCH_CHECK(poses.dim() == 2 && poses.size(1) == 7, "poses must have shape (N, 7)");
     TORCH_CHECK(log_s.dim() == 1 && log_s.numel() == poses.size(0), "log_s must have shape (N,)");
-    TORCH_CHECK(prior_log_s.dim() == 1 && prior_log_s.numel() == poses.size(0), "prior_log_s must have shape (N,)");
     TORCH_CHECK(rel_poses.dim() == 2 && rel_poses.size(1) == 7, "rel_poses must have shape (E, 7)");
-    const int64_t n_nodes64 = poses.size(0);
     const int64_t n_edges64 = rel_poses.size(0);
+    TORCH_CHECK(rel_log_scales.dim() == 1 && rel_log_scales.numel() == n_edges64,
+                "rel_log_scales must have shape (E,)");
     check_edge_index_tensors(ii, jj, n_edges64);
     CHECK_CUDA(sqrt_info);
+    CHECK_CUDA(scale_sqrt_info);
     CHECK_FLOAT(sqrt_info);
+    CHECK_FLOAT(scale_sqrt_info);
     CHECK_CONTIGUOUS(sqrt_info);
+    CHECK_CONTIGUOUS(scale_sqrt_info);
     TORCH_CHECK(sqrt_info.dim() == 2 && sqrt_info.size(0) == n_edges64 && sqrt_info.size(1) == 6,
                 "sqrt_info must have shape (E, 6)");
+    TORCH_CHECK(scale_sqrt_info.dim() == 1 && scale_sqrt_info.numel() == n_edges64,
+                "scale_sqrt_info must have shape (E,)");
+    CHECK_CUDA(source_block);
+    CHECK_CUDA(target_block);
+    CHECK_CUDA(edge_residual);
+    CHECK_CUDA(robust);
+    CHECK_CUDA(summary);
+    CHECK_FLOAT(source_block);
+    CHECK_FLOAT(target_block);
+    CHECK_FLOAT(edge_residual);
+    CHECK_FLOAT(robust);
+    CHECK_FLOAT(summary);
+    CHECK_CONTIGUOUS(source_block);
+    CHECK_CONTIGUOUS(target_block);
+    CHECK_CONTIGUOUS(edge_residual);
+    CHECK_CONTIGUOUS(robust);
+    CHECK_CONTIGUOUS(summary);
+    TORCH_CHECK(source_block.sizes() == torch::IntArrayRef({n_edges64, 7, 7}),
+                "source_block must have shape (E, 7, 7)");
+    TORCH_CHECK(target_block.sizes() == source_block.sizes(), "target_block shape mismatch");
+    TORCH_CHECK(edge_residual.sizes() == torch::IntArrayRef({n_edges64, 7}),
+                "edge_residual must have shape (E, 7)");
+    TORCH_CHECK(robust.sizes() == torch::IntArrayRef({n_edges64, 1}),
+                "robust must have shape (E, 1)");
+    TORCH_CHECK(summary.dim() == 1 && summary.numel() == 2, "summary must have shape (2,)");
 
     const c10::cuda::CUDAGuard device_guard(poses.device());
-    auto source_block = torch::empty({n_edges64, 6, 7}, poses.options());
-    auto target_block = torch::empty({n_edges64, 6, 7}, poses.options());
-    auto edge_residual = torch::empty({n_edges64, 6}, poses.options());
-    auto prior_gradient = torch::empty({n_nodes64}, poses.options());
-    auto robust = torch::empty({n_edges64, 1}, poses.options());
-    auto summary = torch::zeros({2}, poses.options());
-    const int total = static_cast<int>(std::max(n_nodes64, n_edges64));
-    if (total > 0) {
-        const int blocks = (total + THREADS - 1) / THREADS;
+    C10_CUDA_CHECK(cudaMemsetAsync(
+        summary.data_ptr<float>(),
+        0,
+        2 * sizeof(float),
+        at::cuda::getCurrentCUDAStream()));
+    if (n_edges64 > 0) {
+        const int blocks = (n_edges64 + THREADS - 1) / THREADS;
         se3_scale_weighted_blocks_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
             poses.data_ptr<float>(),
             log_s.data_ptr<float>(),
             rel_poses.data_ptr<float>(),
-            prior_log_s.data_ptr<float>(),
+            rel_log_scales.data_ptr<float>(),
             ii.data_ptr<int64_t>(),
             jj.data_ptr<int64_t>(),
             sqrt_info.data_ptr<float>(),
+            scale_sqrt_info.data_ptr<float>(),
             static_cast<float>(huber_delta),
-            static_cast<float>(scale_prior_diag),
-            static_cast<int>(n_nodes64),
             static_cast<int>(n_edges64),
             source_block.data_ptr<float>(),
             target_block.data_ptr<float>(),
             edge_residual.data_ptr<float>(),
-            prior_gradient.data_ptr<float>(),
             robust.data_ptr<float>(),
             summary.data_ptr<float>());
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-
-    auto summary_cpu = summary.to(torch::kCPU);
-    const float* summary_ptr = summary_cpu.data_ptr<float>();
-    return {
-        source_block,
-        target_block,
-        edge_residual,
-        prior_gradient,
-        robust,
-        static_cast<double>(summary_ptr[0]),
-        static_cast<double>(summary_ptr[1]),
-    };
 }
 
-std::tuple<torch::Tensor, torch::Tensor, double, double> se3_scale_candidate_cuda(
-    torch::Tensor poses,
-    torch::Tensor log_s,
-    torch::Tensor step_full,
-    torch::Tensor rel_poses,
-    torch::Tensor prior_log_s,
-    torch::Tensor ii,
-    torch::Tensor jj,
-    torch::Tensor sqrt_info,
-    torch::Tensor robust,
-    int64_t anchor,
-    double scale_prior_diag) {
-    CHECK_CUDA(poses);
-    CHECK_CUDA(log_s);
-    CHECK_CUDA(step_full);
-    CHECK_CUDA(rel_poses);
-    CHECK_CUDA(prior_log_s);
-    CHECK_FLOAT(poses);
-    CHECK_FLOAT(log_s);
-    CHECK_FLOAT(step_full);
-    CHECK_FLOAT(rel_poses);
-    CHECK_FLOAT(prior_log_s);
-    CHECK_CONTIGUOUS(poses);
-    CHECK_CONTIGUOUS(log_s);
-    CHECK_CONTIGUOUS(step_full);
-    CHECK_CONTIGUOUS(rel_poses);
-    CHECK_CONTIGUOUS(prior_log_s);
-    TORCH_CHECK(poses.dim() == 2 && poses.size(1) == 7, "poses must have shape (N, 7)");
-    TORCH_CHECK(step_full.dim() == 2 && step_full.sizes() == poses.sizes(), "step_full must have shape (N, 7)");
-    TORCH_CHECK(log_s.dim() == 1 && log_s.numel() == poses.size(0), "log_s must have shape (N,)");
-    TORCH_CHECK(prior_log_s.dim() == 1 && prior_log_s.numel() == poses.size(0), "prior_log_s must have shape (N,)");
-    TORCH_CHECK(rel_poses.dim() == 2 && rel_poses.size(1) == 7, "rel_poses must have shape (E, 7)");
-    const int64_t n_nodes64 = poses.size(0);
-    const int64_t n_edges64 = rel_poses.size(0);
-    TORCH_CHECK(anchor >= 0 && anchor < n_nodes64, "anchor out of range");
-    check_edge_index_tensors(ii, jj, n_edges64);
-    check_weights(sqrt_info, robust, n_edges64, 6);
+void se3_scale_normal_equations_cuda(
+    torch::Tensor source_block,
+    torch::Tensor target_block,
+    torch::Tensor edge_residual,
+    torch::Tensor hessian_group_offsets,
+    torch::Tensor hessian_metadata,
+    torch::Tensor gradient_group_offsets,
+    torch::Tensor gradient_metadata,
+    torch::Tensor normal) {
+    CHECK_CUDA(source_block);
+    CHECK_CUDA(target_block);
+    CHECK_CUDA(edge_residual);
+    CHECK_CUDA(hessian_group_offsets);
+    CHECK_CUDA(hessian_metadata);
+    CHECK_CUDA(gradient_group_offsets);
+    CHECK_CUDA(gradient_metadata);
+    CHECK_CUDA(normal);
+    CHECK_FLOAT(source_block);
+    CHECK_FLOAT(target_block);
+    CHECK_FLOAT(edge_residual);
+    CHECK_INT(hessian_group_offsets);
+    CHECK_LONG(hessian_metadata);
+    CHECK_INT(gradient_group_offsets);
+    CHECK_LONG(gradient_metadata);
+    TORCH_CHECK(normal.scalar_type() == at::kDouble, "normal must be float64");
+    CHECK_CONTIGUOUS(source_block);
+    CHECK_CONTIGUOUS(target_block);
+    CHECK_CONTIGUOUS(edge_residual);
+    CHECK_CONTIGUOUS(hessian_group_offsets);
+    CHECK_CONTIGUOUS(hessian_metadata);
+    CHECK_CONTIGUOUS(gradient_group_offsets);
+    CHECK_CONTIGUOUS(gradient_metadata);
+    CHECK_CONTIGUOUS(normal);
+    TORCH_CHECK(source_block.dim() == 3 && source_block.size(1) == 7 && source_block.size(2) == 7,
+                "source_block must have shape (E, 7, 7)");
+    TORCH_CHECK(target_block.sizes() == source_block.sizes(), "target_block shape mismatch");
+    TORCH_CHECK(edge_residual.dim() == 2 && edge_residual.size(0) == source_block.size(0) &&
+                edge_residual.size(1) == 7, "edge_residual must have shape (E, 7)");
+    TORCH_CHECK(hessian_group_offsets.dim() == 1 && hessian_group_offsets.numel() >= 1,
+                "hessian_group_offsets must be 1-D");
+    TORCH_CHECK(hessian_metadata.dim() == 1, "hessian_metadata must be 1-D");
+    TORCH_CHECK(gradient_group_offsets.dim() == 1 && gradient_group_offsets.numel() >= 1,
+                "gradient_group_offsets must be 1-D");
+    TORCH_CHECK(gradient_metadata.dim() == 1, "gradient_metadata must be 1-D");
 
-    const c10::cuda::CUDAGuard device_guard(poses.device());
-    auto candidate_poses = torch::empty_like(poses);
-    auto candidate_log_s = torch::empty_like(log_s);
-    auto summary = torch::zeros({2}, poses.options());
-    const int n_nodes = static_cast<int>(n_nodes64);
-    const int n_edges = static_cast<int>(n_edges64);
-    if (n_nodes > 0) {
-        const int blocks = (n_nodes + THREADS - 1) / THREADS;
-        se3_scale_apply_delta_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-            poses.data_ptr<float>(),
-            log_s.data_ptr<float>(),
-            step_full.data_ptr<float>(),
-            static_cast<int>(anchor),
-            n_nodes,
-            candidate_poses.data_ptr<float>(),
-            candidate_log_s.data_ptr<float>());
+    const c10::cuda::CUDAGuard device_guard(source_block.device());
+    const int n_values = static_cast<int>(hessian_group_offsets.numel() - 1);
+    const int n_variables = static_cast<int>(gradient_group_offsets.numel() - 1);
+    TORCH_CHECK(normal.dim() == 1 && normal.numel() == n_values + n_variables,
+                "normal buffer size mismatch");
+    double* values = normal.data_ptr<double>();
+    double* gradient = values + n_values;
+    if (n_values > 0) {
+        const int blocks = (n_values + THREADS - 1) / THREADS;
+        se3_scale_hessian_values_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            source_block.data_ptr<float>(),
+            target_block.data_ptr<float>(),
+            hessian_group_offsets.data_ptr<int>(),
+            hessian_metadata.data_ptr<int64_t>(),
+            n_values,
+            values);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    const int total = static_cast<int>(std::max(n_nodes64, n_edges64));
-    if (total > 0) {
-        const int blocks = (total + THREADS - 1) / THREADS;
-        se3_scale_candidate_summary_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-            candidate_poses.data_ptr<float>(),
-            candidate_log_s.data_ptr<float>(),
-            step_full.data_ptr<float>(),
-            rel_poses.data_ptr<float>(),
-            prior_log_s.data_ptr<float>(),
-            ii.data_ptr<int64_t>(),
-            jj.data_ptr<int64_t>(),
-            sqrt_info.data_ptr<float>(),
-            robust.data_ptr<float>(),
-            static_cast<float>(scale_prior_diag),
-            n_nodes,
-            n_edges,
-            summary.data_ptr<float>());
+    if (n_variables > 0) {
+        const int blocks = (n_variables + THREADS - 1) / THREADS;
+        se3_scale_gradient_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+            source_block.data_ptr<float>(),
+            target_block.data_ptr<float>(),
+            edge_residual.data_ptr<float>(),
+            gradient_group_offsets.data_ptr<int>(),
+            gradient_metadata.data_ptr<int64_t>(),
+            n_variables,
+            gradient);
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-
-    auto summary_cpu = summary.to(torch::kCPU);
-    const float* summary_ptr = summary_cpu.data_ptr<float>();
-    return {
-        candidate_poses,
-        candidate_log_s,
-        static_cast<double>(summary_ptr[0]),
-        static_cast<double>(std::sqrt(static_cast<double>(summary_ptr[1]))),
-    };
-}
-
-std::tuple<double, double, double, double, double, bool> se3_scale_stats_cuda(
-    torch::Tensor poses,
-    torch::Tensor log_s,
-    torch::Tensor rel_poses,
-    torch::Tensor prior_log_s,
-    torch::Tensor ii,
-    torch::Tensor jj,
-    torch::Tensor sqrt_info,
-    double scale_prior_diag) {
-    CHECK_CUDA(poses);
-    CHECK_CUDA(log_s);
-    CHECK_CUDA(rel_poses);
-    CHECK_CUDA(prior_log_s);
-    CHECK_FLOAT(poses);
-    CHECK_FLOAT(log_s);
-    CHECK_FLOAT(rel_poses);
-    CHECK_FLOAT(prior_log_s);
-    CHECK_CONTIGUOUS(poses);
-    CHECK_CONTIGUOUS(log_s);
-    CHECK_CONTIGUOUS(rel_poses);
-    CHECK_CONTIGUOUS(prior_log_s);
-    TORCH_CHECK(poses.dim() == 2 && poses.size(1) == 7, "poses must have shape (N, 7)");
-    TORCH_CHECK(log_s.dim() == 1 && log_s.numel() == poses.size(0), "log_s must have shape (N,)");
-    TORCH_CHECK(prior_log_s.dim() == 1 && prior_log_s.numel() == poses.size(0), "prior_log_s must have shape (N,)");
-    TORCH_CHECK(rel_poses.dim() == 2 && rel_poses.size(1) == 7, "rel_poses must have shape (E, 7)");
-    const int64_t n_nodes64 = poses.size(0);
-    const int64_t n_edges64 = rel_poses.size(0);
-    check_edge_index_tensors(ii, jj, n_edges64);
-    CHECK_CUDA(sqrt_info);
-    CHECK_FLOAT(sqrt_info);
-    CHECK_CONTIGUOUS(sqrt_info);
-    TORCH_CHECK(sqrt_info.dim() == 2 && sqrt_info.size(0) == n_edges64 && sqrt_info.size(1) == 6,
-                "sqrt_info must have shape (E, 6)");
-
-    const c10::cuda::CUDAGuard device_guard(poses.device());
-    auto summary = torch::zeros({6}, poses.options());
-    const int total = static_cast<int>(std::max(n_nodes64, n_edges64));
-    if (total > 0) {
-        const int blocks = (total + THREADS - 1) / THREADS;
-        se3_scale_stats_kernel<<<blocks, THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-            poses.data_ptr<float>(),
-            log_s.data_ptr<float>(),
-            rel_poses.data_ptr<float>(),
-            prior_log_s.data_ptr<float>(),
-            ii.data_ptr<int64_t>(),
-            jj.data_ptr<int64_t>(),
-            sqrt_info.data_ptr<float>(),
-            static_cast<float>(scale_prior_diag),
-            static_cast<int>(n_nodes64),
-            static_cast<int>(n_edges64),
-            summary.data_ptr<float>());
-        C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
-
-    auto summary_cpu = summary.to(torch::kCPU);
-    const float* values = summary_cpu.data_ptr<float>();
-    const double edge_mean = n_edges64 > 0 ? static_cast<double>(values[1]) / static_cast<double>(n_edges64) : 0.0;
-    const double prior_mean = n_nodes64 > 0 ? static_cast<double>(values[3]) / static_cast<double>(n_nodes64) : 0.0;
-    return {
-        static_cast<double>(values[0]),
-        edge_mean,
-        static_cast<double>(values[2]),
-        prior_mean,
-        static_cast<double>(values[4]),
-        values[5] == 0.0f,
-    };
 }

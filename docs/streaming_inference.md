@@ -6,57 +6,38 @@ initializer, offline frontend sweep, or full-sequence backend proximity pass.
 
 ## Runtime Flow
 
-For each incoming frame, `SLAMSystem` first builds a `KeyframeCandidate` with
-GeoNT feature maps, normalized MoGe depth, non-sky mask, source scale, and flow
-bases. The keyframe candidate is not written into `GraphBuffer` until tracking
-accepts it.
+For each incoming frame, `SLAMSystem` builds an uncommitted
+`KeyframeCandidate` containing GeoNT features, MoGe-normalized depth, the fixed
+raw MoGe scale, a valid-depth mask, and flow bases.
 
-The first frame is accepted directly with monocular depth. Later frames first
-run the same coarse optical-flow motion check used by the tracking seed:
-`flow_init` predicts dense flow from the last accepted keyframe to the keyframe
-candidate, and the mean flow magnitude is compared against
-`keyframe_motion_thresh`. Low-motion frames are skipped before multi-view
-bootstrap unless the final frame is forced.
+The first frame is accepted directly. Every later frame runs GeoNT tracking
+aggregation against up to `tracking_multiview_neighbors` previous keyframes.
+The resulting `current -> last` relative pose seeds the frame pose. Coarse flow
+magnitude only decides whether the frame becomes a keyframe; tracking-stage
+edges are never inserted into the pose graph.
 
-Frames that pass the coarse-flow motion check are bootstrapped before commit.
-`SLAMBackend` treats the candidate as the source keyframe and runs GeoNT
-multi-view aggregation against the newest available accepted keyframes, up to
-`depth_bootstrap_neighbors`. The second keyframe uses one previous keyframe;
-the third and later keyframes use two by default. Bootstrap writes refined
-candidate depth in decoder output scale and updates the candidate source scale
-by `source_depth_mean / refined_depth_mean`.
+An accepted keyframe immediately publishes its tracking-refined depth. Once it
+has `local_mapping_radius` later keyframes, the backend performs its single
+temporal finalization: it runs one GeoNT multi-view aggregation, replaces the
+published depth once, and inserts the finalized temporal pose and relative
+log-scale measurements. Nonlocal proximity measurements use one-view pose-only
+inference and the same graph edge store.
 
-After bootstrap, the keyframe candidate is committed to `GraphBuffer`.
-`SLAMBackend` inserts bootstrap pose edges `current -> previous`. The
-`current -> last` edge bypasses local pose/confidence gates and seeds the new
-keyframe pose from the previous keyframe. Additional bootstrap edges, such as
-`current -> last-1`, use the normal local-edge gates.
+Every 10 finalized keyframes, marginalized local PGO optimizes the latest 25
+finalized pose-scale nodes. A dense float64 Schur prior carries GeoNT edge
+information between windows. Local MoGe NIS uses one non-DC DCT slope mode
+(`K=2`) only during the active solve and is not written into the Schur prior.
+The sequence ends with one sparse full-graph PGO using the configured final NIS
+mode count, currently `K=8`.
 
-After a keyframe is accepted, `SLAMBackend` asks `FactorGraph` for local
-proximity candidates, runs GeoNT one-view pose-only inference for those
-candidates, filters local pose edges by pose magnitude and local-edge confidence,
-and inserts accepted measurements directly into the pose graph. There is no
-queued edge state and no marginalization pass.
-
-Sources touched by newly inserted local outgoing edges are then refined with
-multi-view depth aggregation over their explicit local neighbor set. During
-SLAM inference, the raw pre-softmax depth-head gate logits are averaged per
-neighbor and the top `depth_refine_observability_topk` neighbors are used for
-depth aggregation. Depth refinement writes refined depth in decoder output
-scale, updates the source scale by `source_depth_mean / refined_depth_mean`,
-sets `depth_status=REFINED`, and marks `depth_dirty=True`. It does not add or
-update pose graph edges.
-
-Local PGO runs on the recent window using the already inserted pose edges. PGO
-updates local poses and `depths_sens_scale`; stored depth tensors are not
-rescaled by PGO. Consumers should interpret metric depth as:
+`depths_sens_scale` remains the raw MoGe scale. PGO updates the coherent
+`scale` state and never rescales stored depth tensors. Consumers should use:
 
 ```text
-metric_depth = stored_depth * depths_sens_scale
+metric_depth = stored_depth * scale
 ```
 
-When PGO changes a node scale, the corresponding depth is marked dirty without
-rescaling the stored depth map.
+When PGO changes a node scale, the corresponding depth is marked dirty.
 
 ## Edge Convention
 
@@ -66,16 +47,15 @@ Pose graph measurements are directed and source-scale-normalized:
 translation(T_j * inv(T_i)) / scale_i ~= edge_relative_pose_ij[:3]
 ```
 
-`edge_relative_scale` stores the source keyframe scale at edge insertion time as
-a diagnostic/artifact field. PGO optimizes node scales through
-`depths_sens_scale`; edge scale is not a hard residual target.
+`edge_relative_log_scale` is the GeoNT measurement for
+`log(scale_j) - log(scale_i)` and is an active PGO residual.
 
 Saved pose artifacts keep the stable NPZ keys:
 
 - `edge_ii`
 - `edge_jj`
 - `edge_relative_pose`
-- `edge_relative_scale`
+- `edge_relative_log_scale`
 - `edge_confidence`
 
 The Python runtime object names this store `SLAMOutput.pose_edges`.
@@ -93,16 +73,17 @@ initializes camera tokens from local pose priors.
 ```yaml
 local_edge_max_rotation_deg: 30.0
 local_edge_max_translation: 5.0
-keyframe_motion_thresh: 2.5
-local_mapping_window: 8
+keyframe_motion_thresh: 20.0
+local_mapping_window: 25
 local_mapping_radius: 2
 local_mapping_nms: 1
 local_mapping_thresh: 16.0
-local_pgo_every: 1
-local_refine_depth: true
+local_pgo_every: 10
 local_edge_outlier_trans_conf_thresh: 0.1
-depth_bootstrap_neighbors: 2
-depth_refine_observability_topk: 4
+tracking_multiview_neighbors: 2
 pgo_mode: se3_scale
 pgo_backend: cuda_eigen
+pgo_moge_mode_nis: true
+pgo_moge_mode_count: 8
+pgo_moge_mode_nis_cutoff: 0.01
 ```

@@ -208,7 +208,9 @@ class DinoVisionTransformer(nn.Module):
             logger.info("Using camera conditions provided by the user")
             cam_token = kwargs.get("cam_token")
         else:
-            cam_token = self.camera_token[:, 1:, ...].expand(B, S, -1).reshape(B * S, 1, -1)
+            reference_token = self.camera_token[:, :1, ...].expand(B, -1, -1)
+            target_token = self.camera_token[:, 1:, ...].expand(B, S - 1, -1)
+            cam_token = torch.cat((reference_token, target_token), dim=1).reshape(B * S, 1, -1)
         x = torch.cat((cam_token, x), dim=1)
         # x = x + self.interpolate_pos_encoding(x, h0, w0)
         if self.register_tokens is not None:

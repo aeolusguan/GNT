@@ -92,18 +92,15 @@ class GraphBuffer:
             device=device,
             dtype=torch.half,
         )
+        # Raw MoGe depth scale for the normalized monocular prior. This is fixed
+        # after keyframe commit; PGO updates `scale` instead.
         self.depths_sens_scale = torch.zeros(
             buffer_size,
             self.n_views,
             device=device,
             dtype=torch.float,
         )
-        self.pgo_base_scale = torch.zeros(
-            buffer_size,
-            self.n_views,
-            device=device,
-            dtype=torch.float,
-        )
+        self.scale = torch.zeros_like(self.depths_sens_scale)
         # Non sky mask
         self.non_sky_masks = torch.zeros(
             buffer_size,

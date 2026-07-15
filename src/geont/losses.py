@@ -22,7 +22,7 @@ def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
     """
     if input_tensor is None:
         return input_tensor
-    
+
     # Check for inf/nan values
     has_inf_nan = torch.isnan(input_tensor).any() or torch.isinf(input_tensor).any()
     if has_inf_nan:
@@ -32,7 +32,7 @@ def check_and_fix_inf_nan(input_tensor, loss_name="default", hard_max=100):
             torch.zeros_like(input_tensor),
             input_tensor
         )
-    
+
     # Apply hard clamping if specified
     if hard_max is not None:
         input_tensor = torch.clamp(input_tensor, min=-hard_max, max=hard_max)
@@ -129,8 +129,13 @@ class MultitaskLoss(torch.nn.Module):
         """
         pr_depth = predictions["depth"].clip(max=100, min=1e-3)
         pr_depth_conf = predictions["depth_conf"]
-        pr_rel_poses = SE3(predictions["pose_graph"])
-        pr_rel_poses_log_variance = predictions["pose_graph_log_variance"]
+        edge_measurements = predictions["edge_measurements"]
+        # Edge measurement layout: 0:3 translation, 3:7 quaternion,
+        # 7:9 pose confidence/log variance, 9 relative log scale, 10 scale confidence.
+        pr_rel_poses = SE3(edge_measurements[..., :7])
+        pr_rel_poses_log_variance = edge_measurements[..., 7:9]
+        pr_relative_log_scale = edge_measurements[..., 9]
+        pr_scale_confidence = edge_measurements[..., 10]
         gt_depth = batch["depth"]
         # pr_depth/gt_depth/valid_mask: [B,S,H,W].
         valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
@@ -145,29 +150,28 @@ class MultitaskLoss(torch.nn.Module):
 
         intrinsics = batch["intrinsics"]
 
-        cam_loss, geo_metrics = self.compute_camera_loss(gt_pose, pr_rel_poses, graph, gt_scale, pr_rel_poses_log_variance)
+        cam_loss, geo_metrics = self.compute_camera_loss(
+            gt_pose,
+            pr_rel_poses,
+            graph,
+            gt_scale,
+            pr_rel_poses_log_variance,
+            pr_relative_log_scale,
+            pr_scale_confidence,
+        )
         cam_loss = check_and_fix_inf_nan(cam_loss, "cam_loss")
-        flo_loss, front_flow_loss, flo_metrics = flow_loss(gt_pose, 1.0 / gt_depth, pr_rel_poses, 1.0 / pr_depth, intrinsics, graph, valid=valid_mask, flow_predictions=predictions["flow_predictions"], args=self.args)
+        flo_loss, front_flow_loss, flo_metrics = flow_loss(
+            gt_pose,
+            1.0 / gt_depth,
+            pr_rel_poses,
+            1.0 / pr_depth,
+            intrinsics,
+            graph,
+            valid=valid_mask,
+            flow_predictions=predictions["flow_predictions"],
+            args=self.args,
+        )
         flo_loss = check_and_fix_inf_nan(flo_loss, "flo_loss")
-
-        # ii, jj, kk = graph_to_edge_list(graph)
-        # coords0, val0 = projective_transform(gt_pose, 1.0 / gt_depth, intrinsics, ii, jj)
-        # H, W = coords0.shape[2:4]
-        # v, u = torch.meshgrid(
-        #     torch.arange(H, device=coords0.device, dtype=torch.float),
-        #     torch.arange(W, device=coords0.device, dtype=torch.float),
-        #     indexing="ij",
-        # )
-        # flow_gt = coords0 - torch.stack((u, v), dim=-1)
-        # error = torch.abs(flow_gt - predictions["flow"].permute(0, 2, 3, 1)) * val0
-        # print(error[0, 2, 230:240, 360:370].norm(dim=-1))
-        # print(flow_gt[0, 2, 230:240, 360:370, 0])
-        # print(predictions["flow"][2, 0, 230:240, 360:370])
-        # print(gt_depth[0, ii[2], 230:240, 360:370])
-        #print(predictions["info"][2, 230:240, 360:370])
-
-        # NOTE: we put conf inside compute_depth_loss so that we can also apply conf loss to the gradient loss in a multi-scale manner
-        # this is hacky, but very easier to implement
         depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(pr_depth, gt_depth_target, pr_depth_conf, valid_mask)
         depth_loss = depth_grad_loss + depth_conf_loss
         depth_metrics = {'depth_reg': depth_reg_loss.item(), 'depth_grad': depth_grad_loss.item()}
@@ -175,9 +179,17 @@ class MultitaskLoss(torch.nn.Module):
         total_loss = self.args.w_pose * cam_loss + self.args.w_flow * flo_loss + self.args.w_depth * depth_loss + self.args.w_front_flow * front_flow_loss
 
         return total_loss, geo_metrics, flo_metrics, depth_metrics
-        #return total_loss, {}, flo_metrics, {}
     
-    def compute_camera_loss(self, gt_pose: SE3, pr_rel_poses: SE3, graph, gt_scale, pr_rel_pose_log_variance):
+    def compute_camera_loss(
+        self,
+        gt_pose: SE3,
+        pr_rel_poses: SE3,
+        graph,
+        gt_scale,
+        pr_rel_pose_log_variance,
+        pr_relative_log_scale,
+        pr_scale_confidence,
+    ):
         # relative pose
         ii, jj, kk = graph_to_edge_list(graph)
         dP = gt_pose[:,jj] * gt_pose[:,ii].inv()
@@ -188,14 +200,21 @@ class MultitaskLoss(torch.nn.Module):
         dP = dP.scale(1.0 / gt_scale[:, ii])
 
         loss_T, loss_R = camara_loss(pr_rel_poses.data, dP.data, conf=pr_rel_pose_log_variance)
-        cam_loss = loss_T + loss_R
+        gt_relative_log_scale = torch.log(gt_scale[:, jj]) - torch.log(gt_scale[:, ii])
+        scale_residual = (pr_relative_log_scale - gt_relative_log_scale).abs()
+        scale_residual = check_and_fix_inf_nan(scale_residual, "relative_log_scale_loss")
+        scale_loss = scale_residual * pr_scale_confidence - 0.02 * torch.log(pr_scale_confidence)
+        scale_loss = check_and_fix_inf_nan(scale_loss, "relative_log_scale_conf_loss").mean()
+        cam_loss = loss_T + loss_R + scale_loss
 
         dE = Sim3(pr_rel_poses * dP.inv()).detach()
         r_err, t_err, s_err = pose_metrics(dE)
+        scale_error = scale_residual.detach()
 
         metrics = {
             'rot_error': r_err.mean().item(),
             'tr_error': t_err.mean().item(),
+            'scale_error': scale_error.mean().item(),
             'bad_rot': (r_err < .1).float().mean().item(),
             'bad_tr': (t_err < .01).float().mean().item(),
         }

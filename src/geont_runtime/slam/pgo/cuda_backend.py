@@ -67,6 +67,14 @@ def _check_cuda_int64(name: str, tensor: torch.Tensor) -> torch.Tensor:
     return tensor.contiguous()
 
 
+def _check_cpu_float64(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.device.type != "cpu":
+        raise RuntimeError(f"PGO Eigen solver requires {name} to be a CPU tensor")
+    if tensor.dtype != torch.float64:
+        raise RuntimeError(f"PGO Eigen solver requires {name} to be torch.float64")
+    return tensor.contiguous()
+
+
 def build_rotation_blocks(
     rotations: torch.Tensor,
     meas_rotations: torch.Tensor,
@@ -91,25 +99,21 @@ def build_translation_scale_blocks(
     poses: torch.Tensor,
     log_s: torch.Tensor,
     rel_poses: torch.Tensor,
-    prior_log_s: torch.Tensor,
     ii: torch.Tensor,
     jj: torch.Tensor,
     sqrt_info: torch.Tensor,
     robust: torch.Tensor,
-    scale_prior_diag: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build translation+scale PGO blocks in the native CUDA extension."""
     ext = _extension()
     return ext.translation_scale_blocks(
         _check_cuda_float32("poses", poses),
         _check_cuda_float32("log_s", log_s),
         _check_cuda_float32("rel_poses", rel_poses),
-        _check_cuda_float32("prior_log_s", prior_log_s),
         _check_cuda_int64("ii", ii),
         _check_cuda_int64("jj", jj),
         _check_cuda_float32("sqrt_info", sqrt_info),
         _check_cuda_float32("robust", robust),
-        float(scale_prior_diag),
     )
 
 
@@ -117,25 +121,21 @@ def build_se3_scale_blocks(
     poses: torch.Tensor,
     log_s: torch.Tensor,
     rel_poses: torch.Tensor,
-    prior_log_s: torch.Tensor,
     ii: torch.Tensor,
     jj: torch.Tensor,
     sqrt_info: torch.Tensor,
     robust: torch.Tensor,
-    scale_prior_diag: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build SE3+scale PGO blocks in the native CUDA extension."""
     ext = _extension()
     return ext.se3_scale_blocks(
         _check_cuda_float32("poses", poses),
         _check_cuda_float32("log_s", log_s),
         _check_cuda_float32("rel_poses", rel_poses),
-        _check_cuda_float32("prior_log_s", prior_log_s),
         _check_cuda_int64("ii", ii),
         _check_cuda_int64("jj", jj),
         _check_cuda_float32("sqrt_info", sqrt_info),
         _check_cuda_float32("robust", robust),
-        float(scale_prior_diag),
     )
 
 
@@ -143,80 +143,34 @@ def build_se3_scale_weighted_blocks(
     poses: torch.Tensor,
     log_s: torch.Tensor,
     rel_poses: torch.Tensor,
-    prior_log_s: torch.Tensor,
+    rel_log_scales: torch.Tensor,
     ii: torch.Tensor,
     jj: torch.Tensor,
     sqrt_info: torch.Tensor,
+    scale_sqrt_info: torch.Tensor,
     huber_delta: float,
-    scale_prior_diag: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+    buffers: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build Huber-weighted SE3+scale blocks and return current/unrobust costs."""
     ext = _extension()
-    return ext.se3_scale_weighted_blocks(
+    source_block, target_block, edge_residual, robust, summary = buffers
+    ext.se3_scale_weighted_blocks(
         _check_cuda_float32("poses", poses),
         _check_cuda_float32("log_s", log_s),
         _check_cuda_float32("rel_poses", rel_poses),
-        _check_cuda_float32("prior_log_s", prior_log_s),
+        _check_cuda_float32("rel_log_scales", rel_log_scales),
         _check_cuda_int64("ii", ii),
         _check_cuda_int64("jj", jj),
         _check_cuda_float32("sqrt_info", sqrt_info),
+        _check_cuda_float32("scale_sqrt_info", scale_sqrt_info),
         float(huber_delta),
-        float(scale_prior_diag),
-    )
-
-
-def evaluate_se3_scale_candidate(
-    poses: torch.Tensor,
-    log_s: torch.Tensor,
-    step_full: torch.Tensor,
-    rel_poses: torch.Tensor,
-    prior_log_s: torch.Tensor,
-    ii: torch.Tensor,
-    jj: torch.Tensor,
-    sqrt_info: torch.Tensor,
-    robust: torch.Tensor,
-    anchor: int,
-    scale_prior_diag: float,
-) -> tuple[torch.Tensor, torch.Tensor, float, float]:
-    """Apply one SE3+scale LM candidate step and return its weighted cost."""
-    ext = _extension()
-    return ext.se3_scale_candidate(
-        _check_cuda_float32("poses", poses),
-        _check_cuda_float32("log_s", log_s),
-        _check_cuda_float32("step_full", step_full),
-        _check_cuda_float32("rel_poses", rel_poses),
-        _check_cuda_float32("prior_log_s", prior_log_s),
-        _check_cuda_int64("ii", ii),
-        _check_cuda_int64("jj", jj),
-        _check_cuda_float32("sqrt_info", sqrt_info),
+        _check_cuda_float32("source_block", source_block),
+        _check_cuda_float32("target_block", target_block),
+        _check_cuda_float32("edge_residual", edge_residual),
         _check_cuda_float32("robust", robust),
-        int(anchor),
-        float(scale_prior_diag),
+        _check_cuda_float32("summary", summary),
     )
-
-
-def evaluate_se3_scale_stats(
-    poses: torch.Tensor,
-    log_s: torch.Tensor,
-    rel_poses: torch.Tensor,
-    prior_log_s: torch.Tensor,
-    ii: torch.Tensor,
-    jj: torch.Tensor,
-    sqrt_info: torch.Tensor,
-    scale_prior_diag: float,
-) -> tuple[float, float, float, float, float, bool]:
-    """Return final SE3+scale weighted cost and residual summary statistics."""
-    ext = _extension()
-    return ext.se3_scale_stats(
-        _check_cuda_float32("poses", poses),
-        _check_cuda_float32("log_s", log_s),
-        _check_cuda_float32("rel_poses", rel_poses),
-        _check_cuda_float32("prior_log_s", prior_log_s),
-        _check_cuda_int64("ii", ii),
-        _check_cuda_int64("jj", jj),
-        _check_cuda_float32("sqrt_info", sqrt_info),
-        float(scale_prior_diag),
-    )
+    return buffers
 
 
 class RotationEigenSimplicialLLTSolver:
@@ -266,28 +220,24 @@ class TranslationScaleEigenSimplicialLLTSolver:
         source_block: torch.Tensor,
         target_block: torch.Tensor,
         edge_residual: torch.Tensor,
-        prior_gradient: torch.Tensor,
         damping: float,
-        scale_prior_diag: float,
     ) -> torch.Tensor:
         step = self._solver.solve(
             _check_cuda_float32("source_block", source_block),
             _check_cuda_float32("target_block", target_block),
             _check_cuda_float32("edge_residual", edge_residual),
-            _check_cuda_float32("prior_gradient", prior_gradient),
             float(damping),
-            float(scale_prior_diag),
         )
         return step.view(self.n_nodes, 4)
 
 
-class Se3ScaleEigenSimplicialLLTSolver:
-    """Cached CPU Eigen LLT solver for one fixed SE3+scale graph."""
+class Se3ScaleEigenSimplicialLDLTSolver:
+    """Cached CPU Eigen LDLT solver for one fixed SE3+scale graph."""
 
     def __init__(self, ii: torch.Tensor, jj: torch.Tensor, n_nodes: int, anchor: int):
         ext = _extension()
         self.n_nodes = int(n_nodes)
-        self._solver = ext.Se3ScaleEigenSimplicialLLTSolver(
+        self._solver = ext.Se3ScaleEigenSimplicialLDLTSolver(
             _check_cuda_int64("ii", ii),
             _check_cuda_int64("jj", jj),
             self.n_nodes,
@@ -299,50 +249,29 @@ class Se3ScaleEigenSimplicialLLTSolver:
         source_block: torch.Tensor,
         target_block: torch.Tensor,
         edge_residual: torch.Tensor,
-        prior_gradient: torch.Tensor,
         damping: float,
-        scale_prior_diag: float,
     ) -> torch.Tensor:
         step = self._solver.solve(
             _check_cuda_float32("source_block", source_block),
             _check_cuda_float32("target_block", target_block),
             _check_cuda_float32("edge_residual", edge_residual),
-            _check_cuda_float32("prior_gradient", prior_gradient),
             float(damping),
-            float(scale_prior_diag),
         )
         return step.view(self.n_nodes, 7)
 
-    def solve_lm_attempts(
+    def solve_multi_rhs(
         self,
         source_block: torch.Tensor,
         target_block: torch.Tensor,
         edge_residual: torch.Tensor,
-        prior_gradient: torch.Tensor,
-        poses: torch.Tensor,
-        log_s: torch.Tensor,
-        rel_poses: torch.Tensor,
-        prior_log_s: torch.Tensor,
-        sqrt_info: torch.Tensor,
-        robust: torch.Tensor,
-        current_cost: float,
-        lm: float,
-        lm_max_attempts: int,
-        scale_prior_diag: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, float, float, float, bool, int, int]:
-        return self._solver.solve_lm_attempts(
+        scale_rhs: torch.Tensor,
+        damping: float,
+    ) -> torch.Tensor:
+        solutions = self._solver.solve_multi_rhs(
             _check_cuda_float32("source_block", source_block),
             _check_cuda_float32("target_block", target_block),
             _check_cuda_float32("edge_residual", edge_residual),
-            _check_cuda_float32("prior_gradient", prior_gradient),
-            _check_cuda_float32("poses", poses),
-            _check_cuda_float32("log_s", log_s),
-            _check_cuda_float32("rel_poses", rel_poses),
-            _check_cuda_float32("prior_log_s", prior_log_s),
-            _check_cuda_float32("sqrt_info", sqrt_info),
-            _check_cuda_float32("robust", robust),
-            float(current_cost),
-            float(lm),
-            int(lm_max_attempts),
-            float(scale_prior_diag),
+            _check_cpu_float64("scale_rhs", scale_rhs),
+            float(damping),
         )
+        return solutions.view(self.n_nodes, 7, scale_rhs.shape[1] + 1)

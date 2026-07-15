@@ -21,7 +21,6 @@ import numpy as np
 import torch
 from omegaconf import DictConfig
 
-from geont_runtime.slam.pgo.replay import pgo_replay_npz_payload
 from geont_runtime.slam.system import SLAMOutput, SLAMSystem
 from geont_runtime.streams.base import (
     AssignAttributesProcessor,
@@ -72,13 +71,20 @@ class DefaultAnnotationPipeline(Pipeline):
         if slam_output.log_scales is not None:
             log_scales = slam_output.log_scales.cpu().numpy()
         scales = np.exp(log_scales).astype(np.float32) if log_scales.size else np.array([], dtype=np.float32)
+        moge_log_scales = np.array([], dtype=np.float32)
+        if slam_output.moge_log_scales is not None:
+            moge_log_scales = slam_output.moge_log_scales.cpu().numpy()
+        moge_scales = (
+            np.exp(moge_log_scales).astype(np.float32)
+            if moge_log_scales.size
+            else np.array([], dtype=np.float32)
+        )
         pgo_info = slam_output.pgo_info or {}
         pose_edges = slam_output.pose_edges or {}
         edge_np = {
             f"edge_{key}": value.cpu().numpy()
             for key, value in pose_edges.items()
         }
-        replay_np = pgo_replay_npz_payload(slam_output.pgo_replay)
         frame_np = {}
         if slam_output.frame_trajectory is not None:
             frame_trajectory = slam_output.frame_trajectory.data
@@ -95,10 +101,11 @@ class DefaultAnnotationPipeline(Pipeline):
             timestamps=slam_output.keyframe_ids,
             log_scales=log_scales,
             scales=scales,
+            moge_log_scales=moge_log_scales,
+            moge_scales=moge_scales,
             pgo_info=np.array(json.dumps(pgo_info)),
             **frame_np,
             **edge_np,
-            **replay_np,
         )
 
         if slam_output.depths is not None:

@@ -19,12 +19,14 @@
 # -------------------------------------------------------------------------------------------------
 
 import warnings
+import time
 
 import torch
 
 from .buffer import GraphBuffer
+from .measurements import PoseMeasurement
 from geont_runtime.slam.pgo import DEFAULT_LM_MAX_ATTEMPTS, optimize_sim3_pose_graph
-from geont_runtime.slam.pgo.replay import make_pgo_replay_graph
+from geont_runtime.slam.pgo.marginalized_local import MarginalizedLocalPGO
 
 warnings.simplefilter(action="ignore", category=FutureWarning)
 
@@ -35,10 +37,9 @@ class PoseGraphEdges:
         self.jj = torch.as_tensor([], dtype=torch.long, device=device)
         self.edge_key = torch.as_tensor([], dtype=torch.long, device=device)
         self.relative_pose = torch.zeros([0, 7], device=device, dtype=torch.float)
-        self.relative_scale = torch.zeros([0], device=device, dtype=torch.float)
-        self.confidence = torch.zeros([0, 2], device=device, dtype=torch.float)
+        self.relative_log_scale = torch.zeros([0], device=device, dtype=torch.float)
+        self.confidence = torch.zeros([0, 3], device=device, dtype=torch.float)
         self.pgo_info = {}
-        self.pgo_replay = {}
         self._edge_key_stride = 1_000_000
 
     def _make_edge_key(self, ii: torch.Tensor, jj: torch.Tensor) -> torch.Tensor:
@@ -72,10 +73,12 @@ class PoseGraphEdges:
         ii: torch.Tensor,
         jj: torch.Tensor,
         pose: torch.Tensor,
-        scale: torch.Tensor,
+        relative_log_scale: torch.Tensor,
         confidence: torch.Tensor,
     ) -> torch.Tensor:
         assert ii.shape == jj.shape
+        assert relative_log_scale.shape == ii.shape
+        assert confidence.shape == (ii.numel(), 3)
         keep_mask = self.new_edge_mask(ii, jj)
         if not keep_mask.any():
             return torch.zeros(ii.shape[0], device=ii.device, dtype=torch.bool)
@@ -85,22 +88,9 @@ class PoseGraphEdges:
         self.jj = torch.cat((self.jj, jj[keep_idx].long()), dim=0)
         self.edge_key = torch.cat((self.edge_key, self._make_edge_key(ii[keep_idx], jj[keep_idx])), dim=0)
         self.relative_pose = torch.cat((self.relative_pose, pose[keep_idx].float()), dim=0)
-        self.relative_scale = torch.cat((self.relative_scale, scale[keep_idx].float()), dim=0)
+        self.relative_log_scale = torch.cat((self.relative_log_scale, relative_log_scale[keep_idx].float()), dim=0)
         self.confidence = torch.cat((self.confidence, confidence[keep_idx].float()), dim=0)
         return keep_mask
-
-    def add_from(self, other) -> int:
-        keep = self.add(
-            other.ii,
-            other.jj,
-            other.relative_pose,
-            other.relative_scale,
-            other.confidence,
-        )
-        self.pgo_info = dict(other.pgo_info)
-        self.pgo_replay = dict(other.pgo_replay)
-        return int(keep.sum().item())
-
 
 class FactorGraph:
     def __init__(
@@ -111,6 +101,8 @@ class FactorGraph:
         self.buffer = buffer
         self.device = device
         self.edges = PoseGraphEdges(device)
+        self.local_pgo: MarginalizedLocalPGO | None = None
+        self.local_pgo_edge_cursor = 0
 
     def projection_distance(self, ii: torch.Tensor, jj: torch.Tensor, stride: int = 8) -> torch.Tensor:
         if ii.numel() == 0:
@@ -122,7 +114,7 @@ class FactorGraph:
         return geom_cuda.projection_distance(
             self.buffer.poses[:n_frames].float(),
             self.buffer.depths[:n_frames, 0].float(),
-            self.buffer.depths_sens_scale[:n_frames, 0].float(),
+            self.buffer.scale[:n_frames, 0].float(),
             self.buffer.non_sky_masks[:n_frames, 0],
             self.buffer.intrinsics[0].float() / float(stride),
             ii,
@@ -137,20 +129,14 @@ class FactorGraph:
             return empty, empty
         return ii[keep], jj[keep]
 
-    def add_measurement_result(self, result: dict) -> dict:
-        n_candidates = int(result["ii"].numel())
-        keep = self.edges.add(
-            result["ii"],
-            result["jj"],
-            result["relative_pose"],
-            self.buffer.depths_sens_scale[result["ii"], 0].float(),
-            result["confidence"],
+    def add_measurement_result(self, result: PoseMeasurement) -> None:
+        self.edges.add(
+            result.ii,
+            result.jj,
+            result.relative_pose,
+            result.relative_log_scale,
+            result.confidence,
         )
-        n_added = int(keep.sum().item())
-        out = dict(result)
-        out["n_added"] = n_added
-        out["n_duplicates"] = n_candidates - n_added
-        return out
 
     def _bidirectional_pairs(self, ii: torch.Tensor, jj: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         return torch.cat((ii, jj), dim=0), torch.cat((jj, ii), dim=0)
@@ -243,163 +229,92 @@ class FactorGraph:
         damping: float = 1e-3,
         lm_max_attempts: int = DEFAULT_LM_MAX_ATTEMPTS,
         huber_delta: float = 1.0,
-        scale_conf: float = 0.01,
         mode: str = "staged",
         backend: str = "cuda_eigen",
-        extra_info: dict | None = None,
-    ):
-        n_frames = self.buffer.n_frames
-        initial_poses = self.buffer.poses[:n_frames].clone()
-        initial_log_scales = torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6))
-        pgo_info = dict(self.edges.pgo_info)
-        pgo_info.update({"scope": "full_graph", "global_anchor": int(anchor)})
-        if extra_info is not None:
-            pgo_info.update(extra_info)
-        return self._optimize_pose_graph_with_initial_state(
-            initial_poses=initial_poses,
-            initial_log_scales=initial_log_scales,
-            anchor=anchor,
-            n_iters=n_iters,
-            damping=damping,
-            lm_max_attempts=lm_max_attempts,
-            huber_delta=huber_delta,
-            scale_conf=scale_conf,
-            mode=mode,
-            backend=backend,
-            pgo_info=pgo_info,
-        )
-
-    def _optimize_pose_graph_with_initial_state(
-        self,
-        initial_poses: torch.Tensor,
-        initial_log_scales: torch.Tensor,
-        anchor: int,
-        n_iters: int,
-        damping: float,
-        lm_max_attempts: int,
-        huber_delta: float,
-        scale_conf: float,
-        mode: str,
-        backend: str,
-        pgo_info: dict,
+        moge_mode_nis: bool = False,
+        moge_mode_count: int = 8,
+        moge_mode_nis_cutoff: float = 0.01,
     ):
         if self.edges.ii.numel() == 0:
             return None
         n_frames = self.buffer.n_frames
-        self.edges.pgo_replay = make_pgo_replay_graph(
-            n_nodes=n_frames,
-            anchor=anchor,
-            ii=self.edges.ii,
-            jj=self.edges.jj,
-            relative_pose=self.edges.relative_pose,
-            relative_scale=self.edges.relative_scale,
-            confidence=self.edges.confidence,
-            initial_poses=initial_poses,
-            initial_log_scales=initial_log_scales,
-        )
+        initial_poses = self.buffer.poses[:n_frames].clone()
+        initial_log_scales = torch.log(self.buffer.scale[:n_frames, 0].clamp_min(1e-6))
+        moge_log_scales = torch.log(self.buffer.depths_sens_scale[:n_frames, 0].clamp_min(1e-6))
         result = optimize_sim3_pose_graph(
             n_nodes=n_frames,
             ii=self.edges.ii,
             jj=self.edges.jj,
             rel_poses=self.edges.relative_pose,
-            rel_scales=self.edges.relative_scale,
+            rel_log_scales=self.edges.relative_log_scale,
             edge_conf=self.edges.confidence,
             initial_poses=initial_poses,
             initial_log_scales=initial_log_scales,
+            moge_log_scales=moge_log_scales,
             anchor=anchor,
             n_iters=n_iters,
             damping=damping,
             lm_max_attempts=lm_max_attempts,
             huber_delta=huber_delta,
-            scale_conf=scale_conf,
             mode=mode,
             backend=backend,
+            moge_mode_nis=moge_mode_nis,
+            moge_mode_count=moge_mode_count,
+            moge_mode_nis_cutoff=moge_mode_nis_cutoff,
         )
         self.buffer.poses[: self.buffer.n_frames] = result.poses.to(dtype=self.buffer.poses.dtype)
-        new_scales = torch.exp(result.log_scales).to(dtype=self.buffer.depths_sens_scale.dtype)
-        self.buffer.depths_sens_scale[: self.buffer.n_frames, 0] = new_scales
-        result.info = dict(result.info)
-        result.info.update(pgo_info)
+        new_scales = torch.exp(result.log_scales).to(dtype=self.buffer.scale.dtype)
+        self.buffer.scale[: self.buffer.n_frames, 0] = new_scales
         self.edges.pgo_info = result.info
         return result
 
-    def optimize_pose_graph_window(
+    def optimize_local_pgo(
         self,
-        window_start: int,
-        window_end: int,
+        finalized_end: int,
+        window_size: int,
         n_iters: int = 12,
         damping: float = 1e-3,
         lm_max_attempts: int = DEFAULT_LM_MAX_ATTEMPTS,
         huber_delta: float = 1.0,
-        scale_conf: float = 0.01,
-        mode: str = "staged",
-        backend: str = "cuda_eigen",
+        moge_mode_nis_cutoff: float = 0.01,
     ):
-        assert 0 <= window_start < window_end <= self.buffer.n_frames
+        assert 1 < finalized_end <= self.buffer.n_frames
         if self.edges.ii.numel() == 0:
             return None
+        if self.local_pgo is None:
+            self.local_pgo = MarginalizedLocalPGO(window_size)
+        assert self.local_pgo.window_size == int(window_size)
 
-        in_window = (
-            (self.edges.ii >= int(window_start))
-            & (self.edges.ii < int(window_end))
-            & (self.edges.jj >= int(window_start))
-            & (self.edges.jj < int(window_end))
-        )
-        if not in_window.any():
-            return None
-
-        window_size = int(window_end) - int(window_start)
-        local_ii = self.edges.ii[in_window] - int(window_start)
-        local_jj = self.edges.jj[in_window] - int(window_start)
-        relative_pose = self.edges.relative_pose[in_window]
-        relative_scale = self.edges.relative_scale[in_window]
-        confidence = self.edges.confidence[in_window]
-        initial_poses = self.buffer.poses[window_start:window_end].clone()
+        state_start = self.local_pgo.window_start
         initial_log_scales = torch.log(
-            self.buffer.depths_sens_scale[window_start:window_end, 0].clamp_min(1e-6)
+            self.buffer.scale[state_start:finalized_end, 0].clamp_min(1e-6)
         )
-
-        self.edges.pgo_replay = make_pgo_replay_graph(
-            n_nodes=window_size,
-            anchor=0,
-            ii=local_ii,
-            jj=local_jj,
-            relative_pose=relative_pose,
-            relative_scale=relative_scale,
-            confidence=confidence,
-            initial_poses=initial_poses,
-            initial_log_scales=initial_log_scales,
+        moge_log_scales = torch.log(
+            self.buffer.depths_sens_scale[state_start:finalized_end, 0].clamp_min(1e-6)
         )
-        result = optimize_sim3_pose_graph(
-            n_nodes=window_size,
-            ii=local_ii,
-            jj=local_jj,
-            rel_poses=relative_pose,
-            rel_scales=relative_scale,
-            edge_conf=confidence,
-            initial_poses=initial_poses,
-            initial_log_scales=initial_log_scales,
-            anchor=0,
+        edge_start = self.local_pgo_edge_cursor
+        edge_end = int(self.edges.ii.numel())
+        start_time = time.perf_counter()
+        window_start, result = self.local_pgo.step(
+            finalized_end=finalized_end,
+            poses=self.buffer.poses[state_start:finalized_end],
+            log_scales=initial_log_scales,
+            moge_log_scales=moge_log_scales,
+            ii=self.edges.ii[edge_start:edge_end],
+            jj=self.edges.jj[edge_start:edge_end],
+            rel_poses=self.edges.relative_pose[edge_start:edge_end],
+            rel_log_scales=self.edges.relative_log_scale[edge_start:edge_end],
+            edge_conf=self.edges.confidence[edge_start:edge_end],
             n_iters=n_iters,
             damping=damping,
             lm_max_attempts=lm_max_attempts,
             huber_delta=huber_delta,
-            scale_conf=scale_conf,
-            mode=mode,
-            backend=backend,
+            nis_cutoff=moge_mode_nis_cutoff,
         )
-        self.buffer.poses[window_start:window_end] = result.poses.to(dtype=self.buffer.poses.dtype)
-        new_scales = torch.exp(result.log_scales).to(dtype=self.buffer.depths_sens_scale.dtype)
-        self.buffer.depths_sens_scale[window_start:window_end, 0] = new_scales
-        pgo_info = dict(result.info)
-        pgo_info.update(
-            {
-                "scope": "frontend_window",
-                "window_start": int(window_start),
-                "window_end": int(window_end),
-                "global_anchor": int(window_start),
-            }
-        )
-        result.info = pgo_info
-        self.edges.pgo_info = pgo_info
+        self.local_pgo_edge_cursor = edge_end
+        result.info["runtime_sec"] = time.perf_counter() - start_time
+        self.buffer.poses[window_start:finalized_end] = result.poses.to(dtype=self.buffer.poses.dtype)
+        new_scales = torch.exp(result.log_scales).to(dtype=self.buffer.scale.dtype)
+        self.buffer.scale[window_start:finalized_end, 0] = new_scales
+        self.edges.pgo_info = result.info
         return result

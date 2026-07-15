@@ -29,16 +29,17 @@ class CameraDec(nn.Module):
         self.fc_t = nn.Linear(output_dim, 3)
         self.fc_qvec = nn.Linear(output_dim, 4)
         self.fc_s = nn.Linear(output_dim, 2)  # log-variance
+        self.fc_log_scale = nn.Linear(output_dim, 1)
+        self.fc_scale_conf = nn.Linear(output_dim, 1)
 
-    def forward(self, feat, camera_encoding=None, *args, **kwargs):
+    def forward(self, feat):
         B, N = feat.shape[:2]
         feat = feat.reshape(B * N, -1)
         feat = self.backbone(feat.float())
         out_t = self.fc_t(feat).reshape(B, N, 3)
-        if camera_encoding is None:
-            out_qvec = self.fc_qvec(feat).reshape(B, N, 4)
-        else:
-            out_qvec = camera_encoding[..., 3:7]
+        out_qvec = self.fc_qvec(feat).reshape(B, N, 4)
         pos_enc = torch.cat([out_t, out_qvec], dim=-1)
         conf = torch.exp(self.fc_s(feat)).reshape(B, N, 2) + 1
-        return pos_enc, conf
+        relative_log_scale = self.fc_log_scale(feat).reshape(B, N)
+        scale_conf = torch.exp(self.fc_scale_conf(feat)).reshape(B, N) + 1
+        return pos_enc, conf, relative_log_scale, scale_conf

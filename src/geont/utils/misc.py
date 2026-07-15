@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from torch import inf
+from omegaconf import OmegaConf
 
 
 class SmoothedValue(object):
@@ -208,8 +209,7 @@ def save_on_master(*args, **kwargs):
 
 
 def init_distributed_mode(args):
-    nodist = args.nodist if hasattr(args,'nodist') else False
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and not nodist:
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and not args.nodist:
         args.rank = int(os.environ["RANK"])
         args.world_size = int(os.environ['WORLD_SIZE'])
         args.gpu = int(os.environ['LOCAL_RANK'])
@@ -274,12 +274,12 @@ def get_grad_norm_(parameters, norm_type: float = 2.0) -> torch.Tensor:
     return total_norm
 
 
-def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=None):
+def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname):
     output_dir = Path(args.output_dir)
-    if fname is None: fname = str(epoch)
     checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
     to_save = {
         'model': model_without_ddp.state_dict(),
+        'model_config': OmegaConf.to_container(args.model.gnt, resolve=True),
         'optimizer': optimizer.state_dict(),
         'scaler': loss_scaler.state_dict(),
         'args': args,
@@ -289,20 +289,15 @@ def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=Non
     save_on_master(to_save, checkpoint_path)
 
 
-def load_model(args, model_without_ddp, optimizer, loss_scaler):
+def resume_training_state(args, model_without_ddp, optimizer, loss_scaler):
     args.start_epoch = 0
     if args.resume is not None:
-        if args.resume.startswith('https'):
-            checkpoint = torch.hub.load_state_dict_from_url(
-                args.resume, map_location='cpu', check_hash=True)
-        else:
-            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
         print("Resume checkpoint %s" % args.resume)
-        model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        # args.start_epoch = checkpoint['epoch'] + 1
-        # optimizer.load_state_dict(checkpoint['optimizer'])
-        # if 'scaler' in checkpoint:
-        #     loss_scaler.load_state_dict(checkpoint['scaler'])
+        model_without_ddp.load_state_dict(checkpoint['model'])
+        args.start_epoch = checkpoint['epoch'] + 1
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        loss_scaler.load_state_dict(checkpoint['scaler'])
         print("With optim & sched! start_epoch={:d}".format(args.start_epoch), end='')
 
 

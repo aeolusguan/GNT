@@ -148,37 +148,36 @@ def add_loop_closure_edges(
     confidence = torch.as_tensor(edge_confidence, dtype=torch.float32, device=device)
     if confidence.numel() != 2:
         raise ValueError("loop_closure.edge_confidence must contain [translation_conf, rotation_conf]")
+    edge_confidence = torch.cat((confidence, confidence.new_zeros(1)), dim=0)
 
     ii_values: list[int] = []
     jj_values: list[int] = []
     pose_values: list[torch.Tensor] = []
-    scale_values: list[torch.Tensor] = []
     confidence_values: list[torch.Tensor] = []
     for measurement in measurements:
         pose_ij = measurement.relative_pose.to(device=device, dtype=torch.float32).clone()
         pose_ij[3:7] = _normalize_quaternion(pose_ij[3:7])
-        scale_i = graph.buffer.depths_sens_scale[int(measurement.ii), 0].float()
-        scale_j = graph.buffer.depths_sens_scale[int(measurement.jj), 0].float()
+        scale_i = graph.buffer.scale[int(measurement.ii), 0].float()
+        scale_j = graph.buffer.scale[int(measurement.jj), 0].float()
         pose_ij_metric = pose_ij.clone()
         pose_ij_metric[:3] = pose_ij_metric[:3] * scale_i
         pose_ji = _invert_pose(pose_ij_metric)
         pose_ji[:3] = pose_ji[:3] / scale_j.clamp_min(1e-6)
-        for src, dst, pose, scale in (
-            (measurement.ii, measurement.jj, pose_ij, scale_i),
-            (measurement.jj, measurement.ii, pose_ji, scale_j),
+        for src, dst, pose in (
+            (measurement.ii, measurement.jj, pose_ij),
+            (measurement.jj, measurement.ii, pose_ji),
         ):
             ii_values.append(int(src))
             jj_values.append(int(dst))
             pose_values.append(pose)
-            scale_values.append(scale)
-            confidence_values.append(confidence)
+            confidence_values.append(edge_confidence)
 
     ii = torch.as_tensor(ii_values, dtype=torch.long, device=device)
     jj = torch.as_tensor(jj_values, dtype=torch.long, device=device)
     pose = torch.stack(pose_values, dim=0)
-    scale = torch.stack(scale_values, dim=0)
+    relative_log_scale = torch.zeros(ii.shape, dtype=torch.float32, device=device)
     edge_conf = torch.stack(confidence_values, dim=0)
-    keep = graph.edges.add(ii, jj, pose, scale, edge_conf)
+    keep = graph.edges.add(ii, jj, pose, relative_log_scale, edge_conf)
     return int(keep.sum().item())
 
 
@@ -187,32 +186,12 @@ def loop_closure_info(
     candidates: Sequence[LoopCandidate],
     measurements: Sequence[LoopMeasurement],
     added_edges: int,
-    config_summary: dict,
 ) -> dict:
-    match_counts = [int(measurement.n_matches) for measurement in measurements]
-    info = {
+    return {
         "loop_closure_candidates": int(len(candidates)),
         "loop_closure_accepted_pairs": int(len(measurements)),
         "loop_closure_added_edges": int(added_edges),
-        "loop_closure_config": dict(config_summary),
     }
-    if match_counts:
-        info.update(
-            {
-                "loop_closure_match_count_min": int(min(match_counts)),
-                "loop_closure_match_count_mean": float(sum(match_counts) / len(match_counts)),
-                "loop_closure_match_count_max": int(max(match_counts)),
-            }
-        )
-    else:
-        info.update(
-            {
-                "loop_closure_match_count_min": 0,
-                "loop_closure_match_count_mean": 0.0,
-                "loop_closure_match_count_max": 0,
-            }
-        )
-    return info
 
 
 class Mast3RLoopClosureAdapter:
@@ -345,7 +324,7 @@ class Mast3RLoopClosureAdapter:
         device = graph.device
         direction = torch.as_tensor(translation[:, 0], dtype=torch.float32, device=device)
         direction = direction / direction.norm().clamp_min(1e-6)
-        source_scale = graph.buffer.depths_sens_scale[candidate.ii, 0].float().clamp_min(1e-6)
+        source_scale = graph.buffer.scale[candidate.ii, 0].float().clamp_min(1e-6)
         current_baseline = (graph.buffer.poses[candidate.jj, :3] - graph.buffer.poses[candidate.ii, :3]).norm()
         translation_norm = current_baseline / source_scale
         quat = _matrix_to_quaternion(rotation, device=device)
@@ -381,14 +360,6 @@ def run_mast3r_loop_closure(
     *,
     adapter: Mast3RLoopClosureAdapter | None = None,
 ) -> dict:
-    config_summary = {
-        "topk": int(cfg.topk),
-        "temporal_exclusion": int(cfg.temporal_exclusion),
-        "retrieval_score_thresh": float(cfg.retrieval_score_thresh),
-        "min_matches": int(cfg.min_matches),
-        "max_pairs": int(cfg.max_pairs),
-        "edge_confidence": [float(v) for v in cfg.edge_confidence],
-    }
     if adapter is None:
         vendor_path = Path(str(cfg.vendor_path) if "vendor_path" in cfg else "third_party/mast3r_slam/upstream")
         retriever_checkpoint = None
@@ -416,7 +387,5 @@ def run_mast3r_loop_closure(
         candidates=candidates,
         measurements=measurements,
         added_edges=added_edges,
-        config_summary=config_summary,
     )
-    graph.edges.pgo_info.update(info)
     return info

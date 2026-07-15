@@ -1,6 +1,6 @@
 tartanair_root: datasets/TartanAir
 split: src/geont/data/tartan_test.txt
-ckpt: output/checkpoint-latest.pth
+ckpt: ???
 output: outputs/tartanair_pgo_eval
 
 scenes: []
@@ -16,18 +16,19 @@ slam:
   pgo_damping: 1.0e-3
   pgo_lm_max_attempts: 5
   pgo_huber_delta: 0.05
-  pgo_scale_conf: 0.01
   pgo_mode: se3_scale
-  pgo_rotation_only: false
   pgo_backend: cuda_eigen
+  pgo_moge_mode_nis: true
+  pgo_moge_mode_count: 8
+  pgo_moge_mode_nis_cutoff: 0.01
   local_edge_outlier_trans_conf_thresh: 0.1
   local_edge_max_rotation_deg: 30.0
   local_edge_max_translation: 5.0
-  keyframe_motion_thresh: 2.5
+  keyframe_motion_thresh: 20.0
   local_mapping_window: 25
   local_mapping_radius: 2
   local_mapping_nms: 1
   local_mapping_thresh: 16.0
-  local_pgo_every: 1
+  local_pgo_every: 10
   tracking_multiview_neighbors: 2
   use_fp16: true

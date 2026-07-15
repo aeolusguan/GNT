@@ -25,6 +25,8 @@ class DinoV2(nn.Module):
         self,
         name: str,
         out_layers: List[int],
+        img_size: int = 512,
+        patch_size: int = 16,
         alt_start: int = -1,
         qknorm_start: int = -1,
         rope_start: int = -1,
@@ -37,7 +39,10 @@ class DinoV2(nn.Module):
         self.out_layers = out_layers
         self.alt_start = alt_start
         self.qknorm_start = qknorm_start
+        self.rope_start = rope_start
         self.cat_token = cat_token
+        self.img_size = img_size
+        self.patch_size = patch_size
         encoder_map = {
             "vits": vit_small,
             "vitb": vit_base,
@@ -47,8 +52,8 @@ class DinoV2(nn.Module):
         encoder_fn = encoder_map[self.name]
         ffn_layer = "swiglufused" if self.name == "vitg" else "mlp"
         self.pretrained = encoder_fn(
-            img_size=512,
-            patch_size=16,
+            img_size=img_size,
+            patch_size=patch_size,
             ffn_layer=ffn_layer,
             alt_start=alt_start,
             qknorm_start=qknorm_start,

@@ -20,7 +20,6 @@ if str(SRC) not in sys.path:
 from geont_runtime.inference import build_streaming_config
 from lietorch import SE3
 from geont_runtime.pipeline.default import DefaultAnnotationPipeline
-from geont_runtime.slam.pgo.replay import save_pgo_replay_graph
 from geont_runtime.streams.frame_dir_stream import FrameDirStream
 
 
@@ -121,6 +120,12 @@ def _vector_angle_errors_deg(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     return angle
 
 
+def _per_edge_translation_alignment(pred: np.ndarray, gt: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    denom = np.sum(pred * pred, axis=1)
+    scale = np.sum(pred * gt, axis=1) / np.maximum(denom, 1e-12)
+    return pred * scale[:, None], scale
+
+
 def _stats(values: np.ndarray, prefix: str) -> dict[str, float]:
     finite = values[np.isfinite(values)]
     if finite.size == 0:
@@ -135,37 +140,6 @@ def _stats(values: np.ndarray, prefix: str) -> dict[str, float]:
         f"{prefix}_median": float(np.median(finite)),
         f"{prefix}_p90": float(np.quantile(finite, 0.9)),
         f"{prefix}_max": float(np.max(finite)),
-    }
-
-
-def _pearson(x: np.ndarray, y: np.ndarray) -> float:
-    mask = np.isfinite(x) & np.isfinite(y)
-    if np.count_nonzero(mask) < 2:
-        return 0.0
-    x = x[mask]
-    y = y[mask]
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = np.sqrt(np.sum(x * x) * np.sum(y * y))
-    if denom < 1e-12:
-        return 0.0
-    return float(np.sum(x * y) / denom)
-
-
-def _confidence_tail_means(conf: np.ndarray, error: np.ndarray, prefix: str) -> dict[str, float]:
-    mask = np.isfinite(conf) & np.isfinite(error)
-    if np.count_nonzero(mask) < 4:
-        return {
-            f"{prefix}_low_conf_mean": 0.0,
-            f"{prefix}_high_conf_mean": 0.0,
-        }
-    conf = conf[mask]
-    error = error[mask]
-    low_thr = np.quantile(conf, 0.25)
-    high_thr = np.quantile(conf, 0.75)
-    return {
-        f"{prefix}_low_conf_mean": float(error[conf <= low_thr].mean()),
-        f"{prefix}_high_conf_mean": float(error[conf >= high_thr].mean()),
     }
 
 
@@ -201,10 +175,8 @@ def _edge_error_rows(
     ii = pose_edges["ii"].detach().cpu().numpy().astype(np.int64)
     jj = pose_edges["jj"].detach().cpu().numpy().astype(np.int64)
     rel_pose = pose_edges["relative_pose"].detach().cpu().numpy()
-    edge_scale = pose_edges["relative_scale"].detach().cpu().numpy()
+    edge_log_scale = pose_edges["relative_log_scale"].detach().cpu().numpy()
     confidence = pose_edges["confidence"].detach().cpu().numpy()
-    if confidence.ndim == 1:
-        confidence = np.stack((confidence, confidence), axis=1)
     node_scales = slam_output.scales.detach().cpu().numpy() if slam_output.scales is not None else np.ones(len(keyframe_ids))
     optimized_poses = slam_output.trajectory.data.detach().cpu().numpy()
 
@@ -212,16 +184,16 @@ def _edge_error_rows(
     optimized_rel_t, optimized_rel_R = _relative_pose(optimized_poses, ii, jj)
     pred_rel_t = rel_pose[:, :3]
     pred_rel_R = _quat_to_matrix(rel_pose[:, 3:7])
-    pred_metric_edge_scale = pred_rel_t * edge_scale[:, None]
+    pred_metric_edge_align, pred_edge_align_scale = _per_edge_translation_alignment(pred_rel_t, gt_rel_t)
     pred_metric_node_scale = pred_rel_t * node_scales[ii, None]
 
     gt_t_norm = np.linalg.norm(gt_rel_t, axis=1)
-    pred_edge_norm = np.linalg.norm(pred_metric_edge_scale, axis=1)
+    pred_edge_norm = np.linalg.norm(pred_metric_edge_align, axis=1)
     pred_node_norm = np.linalg.norm(pred_metric_node_scale, axis=1)
     optimized_t_norm = np.linalg.norm(optimized_rel_t, axis=1)
     trans_dir_err = _vector_angle_errors_deg(pred_rel_t, gt_rel_t)
     optimized_trans_dir_err = _vector_angle_errors_deg(optimized_rel_t, gt_rel_t)
-    trans_edge_scale_err = np.linalg.norm(pred_metric_edge_scale - gt_rel_t, axis=1)
+    trans_edge_scale_err = np.linalg.norm(pred_metric_edge_align - gt_rel_t, axis=1)
     trans_node_scale_err = np.linalg.norm(pred_metric_node_scale - gt_rel_t, axis=1)
     optimized_trans_err = np.linalg.norm(optimized_rel_t - gt_rel_t, axis=1)
     trans_node_improvement = trans_node_scale_err - optimized_trans_err
@@ -243,7 +215,10 @@ def _edge_error_rows(
                 "span": int(abs(jj[edge_id] - ii[edge_id])),
                 "trans_conf": float(confidence[edge_id, 0]),
                 "rot_conf": float(confidence[edge_id, 1]),
-                "edge_relative_scale": float(edge_scale[edge_id]),
+                "scale_conf": float(confidence[edge_id, 2]),
+                "edge_relative_log_scale": float(edge_log_scale[edge_id]),
+                "edge_relative_scale": float(np.exp(edge_log_scale[edge_id])),
+                "per_edge_translation_align_scale": float(pred_edge_align_scale[edge_id]),
                 "node_source_scale": float(node_scales[ii[edge_id]]),
                 "gt_translation_norm": float(gt_t_norm[edge_id]),
                 "pred_edge_scale_translation_norm": float(pred_edge_norm[edge_id]),
@@ -252,11 +227,11 @@ def _edge_error_rows(
                 "translation_direction_error_deg": float(trans_dir_err[edge_id]),
                 "optimized_translation_direction_error_deg": float(optimized_trans_dir_err[edge_id]),
                 "translation_direction_improvement_deg": float(trans_dir_improvement[edge_id]),
-                "translation_edge_scale_error": float(trans_edge_scale_err[edge_id]),
+                "translation_per_edge_aligned_error": float(trans_edge_scale_err[edge_id]),
                 "translation_node_scale_error": float(trans_node_scale_err[edge_id]),
                 "optimized_translation_error": float(optimized_trans_err[edge_id]),
                 "translation_node_scale_error_improvement": float(trans_node_improvement[edge_id]),
-                "translation_edge_scale_ratio": float(pred_edge_norm[edge_id] / max(gt_t_norm[edge_id], 1e-12)),
+                "translation_per_edge_aligned_ratio": float(pred_edge_norm[edge_id] / max(gt_t_norm[edge_id], 1e-12)),
                 "translation_node_scale_ratio": float(pred_node_norm[edge_id] / max(gt_t_norm[edge_id], 1e-12)),
                 "optimized_translation_ratio": float(optimized_t_norm[edge_id] / max(gt_t_norm[edge_id], 1e-12)),
                 "rotation_error_deg": float(rot_err[edge_id]),
@@ -279,53 +254,28 @@ def _edge_error_rows(
 def _edge_summary(edge_rows: list[dict], prefix: str = "edge") -> dict[str, float]:
     if not edge_rows:
         return {f"{prefix}_count": 0}
-    trans_conf = np.asarray([row["trans_conf"] for row in edge_rows], dtype=np.float64)
-    rot_conf = np.asarray([row["rot_conf"] for row in edge_rows], dtype=np.float64)
     trans_dir = np.asarray([row["translation_direction_error_deg"] for row in edge_rows], dtype=np.float64)
     opt_trans_dir = np.asarray([row["optimized_translation_direction_error_deg"] for row in edge_rows], dtype=np.float64)
-    trans_dir_improvement = np.asarray([row["translation_direction_improvement_deg"] for row in edge_rows], dtype=np.float64)
-    trans_edge = np.asarray([row["translation_edge_scale_error"] for row in edge_rows], dtype=np.float64)
+    trans_edge = np.asarray([row["translation_per_edge_aligned_error"] for row in edge_rows], dtype=np.float64)
     trans_node = np.asarray([row["translation_node_scale_error"] for row in edge_rows], dtype=np.float64)
     opt_trans = np.asarray([row["optimized_translation_error"] for row in edge_rows], dtype=np.float64)
-    trans_improvement = np.asarray([row["translation_node_scale_error_improvement"] for row in edge_rows], dtype=np.float64)
-    ratio_edge = np.asarray([row["translation_edge_scale_ratio"] for row in edge_rows], dtype=np.float64)
+    ratio_edge = np.asarray([row["translation_per_edge_aligned_ratio"] for row in edge_rows], dtype=np.float64)
     ratio_node = np.asarray([row["translation_node_scale_ratio"] for row in edge_rows], dtype=np.float64)
     ratio_opt = np.asarray([row["optimized_translation_ratio"] for row in edge_rows], dtype=np.float64)
     rot = np.asarray([row["rotation_error_deg"] for row in edge_rows], dtype=np.float64)
     opt_rot = np.asarray([row["optimized_rotation_error_deg"] for row in edge_rows], dtype=np.float64)
-    rot_improvement = np.asarray([row["rotation_error_improvement_deg"] for row in edge_rows], dtype=np.float64)
 
     out = {f"{prefix}_count": len(edge_rows)}
-    out.update(_stats(trans_conf, f"{prefix}_trans_conf"))
-    out.update(_stats(rot_conf, f"{prefix}_rot_conf"))
     out.update(_stats(trans_dir, f"{prefix}_translation_direction_error_deg"))
     out.update(_stats(opt_trans_dir, f"{prefix}_optimized_translation_direction_error_deg"))
-    out.update(_stats(trans_dir_improvement, f"{prefix}_translation_direction_improvement_deg"))
-    out.update(_stats(trans_edge, f"{prefix}_translation_edge_scale_error"))
+    out.update(_stats(trans_edge, f"{prefix}_translation_per_edge_aligned_error"))
     out.update(_stats(trans_node, f"{prefix}_translation_node_scale_error"))
     out.update(_stats(opt_trans, f"{prefix}_optimized_translation_error"))
-    out.update(_stats(trans_improvement, f"{prefix}_translation_node_scale_error_improvement"))
-    out.update(_stats(ratio_edge, f"{prefix}_translation_edge_scale_ratio"))
+    out.update(_stats(ratio_edge, f"{prefix}_translation_per_edge_aligned_ratio"))
     out.update(_stats(ratio_node, f"{prefix}_translation_node_scale_ratio"))
     out.update(_stats(ratio_opt, f"{prefix}_optimized_translation_ratio"))
     out.update(_stats(rot, f"{prefix}_rotation_error_deg"))
     out.update(_stats(opt_rot, f"{prefix}_optimized_rotation_error_deg"))
-    out.update(_stats(rot_improvement, f"{prefix}_rotation_error_improvement_deg"))
-    out[f"{prefix}_optimized_translation_better_fraction"] = float(np.mean(opt_trans < trans_node))
-    out[f"{prefix}_optimized_translation_direction_better_fraction"] = float(np.mean(opt_trans_dir < trans_dir))
-    out[f"{prefix}_optimized_rotation_better_fraction"] = float(np.mean(opt_rot < rot))
-    out[f"{prefix}_trans_conf_vs_direction_error_pearson"] = _pearson(trans_conf, trans_dir)
-    out[f"{prefix}_trans_conf_vs_optimized_direction_error_pearson"] = _pearson(trans_conf, opt_trans_dir)
-    out[f"{prefix}_trans_conf_vs_edge_scale_error_pearson"] = _pearson(trans_conf, trans_edge)
-    out[f"{prefix}_trans_conf_vs_node_scale_error_pearson"] = _pearson(trans_conf, trans_node)
-    out[f"{prefix}_trans_conf_vs_optimized_translation_error_pearson"] = _pearson(trans_conf, opt_trans)
-    out[f"{prefix}_rot_conf_vs_rotation_error_pearson"] = _pearson(rot_conf, rot)
-    out.update(_confidence_tail_means(trans_conf, trans_dir, f"{prefix}_translation_direction_error_deg"))
-    out.update(_confidence_tail_means(trans_conf, opt_trans_dir, f"{prefix}_optimized_translation_direction_error_deg"))
-    out.update(_confidence_tail_means(trans_conf, trans_edge, f"{prefix}_translation_edge_scale_error"))
-    out.update(_confidence_tail_means(trans_conf, trans_node, f"{prefix}_translation_node_scale_error"))
-    out.update(_confidence_tail_means(trans_conf, opt_trans, f"{prefix}_optimized_translation_error"))
-    out.update(_confidence_tail_means(rot_conf, rot, f"{prefix}_rotation_error_deg"))
     return out
 
 
@@ -378,14 +328,6 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
     edge_csv = output_dir / "edge_relative_pose_errors.csv"
     _write_edge_csv(edge_csv, edge_rows)
     pgo_info = slam_output.pgo_info or {}
-    replay_graph = output_dir / "pgo_replay_graph.npz"
-    if slam_output.pgo_replay:
-        save_pgo_replay_graph(
-            replay_graph,
-            slam_output.pgo_replay,
-            pgo_info=pgo_info,
-            timestamps=keyframe_ids,
-        )
     metrics.update(
         {
             "scene_index": scene_index,
@@ -399,15 +341,14 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
             "pgo_success": bool(pgo_info.get("success", False)),
             "pgo_mode": str(pgo_info.get("mode", "")),
             "pgo_backend": str(pgo_info.get("backend", "")),
-            "pgo_linear_solver": str(pgo_info.get("linear_solver", "")),
-            "pgo_normal_equation_assembly": str(pgo_info.get("normal_equation_assembly", "")),
-            "pgo_linear_solver_impl": str(pgo_info.get("linear_solver_impl", "")),
             "pgo_runtime_sec": float(pgo_info.get("runtime_sec", 0.0)),
             "pgo_cost": float(pgo_info.get("cost", 0.0)),
-            "pgo_edge_residual_mean": float(pgo_info.get("edge_residual_mean", 0.0)),
-            "pgo_scale_prior_residual_mean": float(pgo_info.get("scale_prior_residual_mean", 0.0)),
+            "local_pgo_runs": int(pgo_info.get("local_pgo_runs", 0)),
+            "local_pgo_runtime_sec": float(pgo_info.get("local_pgo_runtime_sec", 0.0)),
+            "local_pgo_last_moge_mode_alpha": float(
+                pgo_info.get("local_pgo_last_moge_mode_alpha", 0.0)
+            ),
             "edge_error_csv": str(edge_csv),
-            "pgo_replay_graph": str(replay_graph) if slam_output.pgo_replay else "",
         }
     )
     metrics.update(_edge_summary(edge_rows))
@@ -427,6 +368,7 @@ def _summarize(rows: list[dict], edge_rows: list[dict]) -> dict[str, float]:
         "keyframes",
         "edge_count",
         "pgo_runtime_sec",
+        "local_pgo_runtime_sec",
     ]
     summary = {"scenes": len(rows)}
     for key in keys:
