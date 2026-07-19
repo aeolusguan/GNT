@@ -6,7 +6,6 @@ import time
 import math
 from pathlib import Path
 from typing import Sized
-from collections import OrderedDict
 
 import hydra
 import torch
@@ -190,12 +189,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # poses w2c
         images, poses, depths, depths_valid, intrinsics = [x.to(device) for x in batch]
 
-        if np.random.rand() < 0.5:
-            graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
-        else:
-            graph = OrderedDict()
-            for i in range(args.n_frames):
-                graph[i] = [j for j in range(args.n_frames) if i!=j and abs(i-j) <= 2]
+        graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
 
         prediction = model(
             images,

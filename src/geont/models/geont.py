@@ -341,8 +341,7 @@ class GeoNTWrapper(nn.Module):
                 "depth": scaled_depth[fi],  # [H,W]
                 "mask": train_depth_valid[fi],  # [H,W]
             }
-            target_scale_ratio = scale[jj[mask]] / scale[fi]
-            target_depth = scaled_depth[jj[mask]] * target_scale_ratio[:, None, None]
+            target_depth = scaled_depth[jj[mask]]
             target_depth_input = {
                 "depth": target_depth,  # [E_i,H,W], normalized in source/reference gauge.
                 "mask": train_depth_valid[jj[mask]],  # [E_i,H,W]

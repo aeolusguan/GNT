@@ -244,8 +244,8 @@ class GeoNTMeasurements:
         intrinsics = self.buffer.intrinsics[0:1].expand(ii.numel(), -1).contiguous()
         source_depth = self.buffer.depths_sens_normed[ii, 0].float()
         source_mask = self.buffer.non_sky_masks[ii, 0]
-        target_scale_ratio = self.buffer.depths_sens_scale[jj, 0].float() / self.buffer.depths_sens_scale[ii, 0].float()
-        target_depth = self.buffer.depths_sens_normed[jj, 0].float() * target_scale_ratio[:, None, None]
+        # target_scale_ratio = self.buffer.depths_sens_scale[jj, 0].float() / self.buffer.depths_sens_scale[ii, 0].float()
+        target_depth = self.buffer.depths_sens_normed[jj, 0].float()
         target_mask = self.buffer.non_sky_masks[jj, 0]
         zero_flow = torch.zeros_like(flow)
         zero_info = torch.zeros_like(info)
@@ -281,8 +281,8 @@ class GeoNTMeasurements:
         target_intrinsics = self.buffer.intrinsics[0:1].expand(neighbors.numel(), -1).contiguous()
         source_depth = keyframe_candidate.depth_sens_normed[0].float()
         source_mask = keyframe_candidate.mask[0]
-        target_scale_ratio = self.buffer.depths_sens_scale[neighbors, 0].float() / keyframe_candidate.scale[0].float()
-        target_depth = self.buffer.depths_sens_normed[neighbors, 0].float() * target_scale_ratio[:, None, None]
+        # target_scale_ratio = self.buffer.depths_sens_scale[neighbors, 0].float() / keyframe_candidate.scale[0].float()
+        target_depth = self.buffer.depths_sens_normed[neighbors, 0].float()
         target_mask = self.buffer.non_sky_masks[neighbors, 0]
         measurement = self.predict_pose_depth_impl(
             ii,
@@ -313,8 +313,8 @@ class GeoNTMeasurements:
         target_intrinsics = self.buffer.intrinsics[0:1].expand(neighbors.numel(), -1).contiguous()
         source_depth = self.buffer.depths_sens_normed[source, 0].float()
         source_mask = self.buffer.non_sky_masks[source, 0]
-        target_scale_ratio = self.buffer.depths_sens_scale[neighbors, 0].float() / self.buffer.depths_sens_scale[source, 0].float()
-        target_depth = self.buffer.depths_sens_normed[neighbors, 0].float() * target_scale_ratio[:, None, None]
+        # target_scale_ratio = self.buffer.depths_sens_scale[neighbors, 0].float() / self.buffer.depths_sens_scale[source, 0].float()
+        target_depth = self.buffer.depths_sens_normed[neighbors, 0].float()
         target_mask = self.buffer.non_sky_masks[neighbors, 0]
         return self.predict_pose_depth_impl(
             ii,
