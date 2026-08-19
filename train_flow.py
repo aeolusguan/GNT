@@ -6,10 +6,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-sys.path.append(str(SRC / "geont" / "models" / "flow"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+sys.path.append(str(ROOT / "gent" / "model" / "flow"))
 
 import argparse
 import numpy as np
@@ -25,8 +24,8 @@ from core.datasets import fetch_dataloader
 from core.utils.utils import load_ckpt
 from core.loss import sequence_loss, init_loss
 import os
-import geont.utils.misc as misc
-from geont.models.external import load_moge
+import gent.utils.misc as misc
+from gent.model.external import load_moge
 
 os.system("export KMP_INIT_AT_FORK=FALSE")
 

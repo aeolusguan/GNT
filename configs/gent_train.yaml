@@ -1,0 +1,68 @@
+fmin: 8.0
+fmax: 96.0
+
+seed: 0
+batch_size: 1
+accum_iter: 1
+epochs: 800
+weight_decay: 0.05
+lr: null
+blr: 1.5e-4
+min_lr: 0.0
+warmup_epochs: 40
+amp: 0
+disable_cudnn_benchmark: false
+resume: null
+n_frames: 7
+edges: 24
+data:
+  tartanair:
+    root: datasets/TartanAir
+    samples_per_epoch: 5000
+  arkitscenes:
+    root: datasets/ARKitScenes_processed
+    samples_per_epoch: 2500
+  dynamic_replica:
+    root: datasets/dynamic_replica
+    samples_per_epoch: 2500
+w_pose: 5.0
+w_flow: 0.05
+w_depth: 1.0
+w_front_flow: 1.0
+depth_valid_range: 0.98  # Drop the noisiest 2% of depth residuals.
+var_min: 0.0
+var_max: 10.0
+gamma: 0.8
+num_workers: 8
+rank: 0
+world_size: 1
+gpu: 0
+distributed: false
+dist_backend: nccl
+dist_url: env://
+nodist: false
+start_epoch: 0
+save_freq: 1
+keep_freq: 5
+print_freq: 20
+
+output_dir: ./output/
+
+init:
+  checkpoint: null
+  da3:
+    path: ???
+
+model:
+  gnt:
+    camera_encoder: null
+    backbone:
+      _target_: gent.model.dinov2.dinov2.DinoV2
+      name: vitb
+      img_size: 512
+      patch_size: 16
+      out_layers: [11]
+      alt_start: 4
+      qknorm_start: 4
+      rope_start: 4
+      cat_token: true

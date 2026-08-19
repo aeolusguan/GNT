@@ -3,17 +3,18 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geont"
+name = "gent"
 version = "0.1.0"
-description = "GeoNT model and streaming runtime research code"
+description = "GeNT model and streaming runtime research code"
 requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
-inference = "geont_runtime.inference:console_main"
+inference = "gent.runtime.inference:console_main"
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["."]
+include = ["gent*"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+pythonpath = ["."]

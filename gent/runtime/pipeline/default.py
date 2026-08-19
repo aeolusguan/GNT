@@ -1,0 +1,152 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from pathlib import Path
+
+import json
+import numpy as np
+import torch
+from omegaconf import DictConfig
+
+from gent.runtime.slam.system import SLAMOutput, SLAMSystem
+from gent.runtime.streams.base import (
+    AssignAttributesProcessor,
+    FrameAttribute,
+    ProcessedVideoStream,
+    StreamProcessor,
+    VideoStream,
+)
+from gent.runtime.utils import io
+
+from . import AnnotationPipelineOutput, Pipeline
+
+logger = logging.getLogger(__name__)
+
+
+class DefaultAnnotationPipeline(Pipeline):
+    def __init__(self, init: DictConfig, slam: DictConfig, post: DictConfig, output: DictConfig) -> None:
+        super().__init__()
+        self.init_cfg = init
+        self.slam_cfg = slam
+        self.post_cfg = post
+        self.out_cfg = output
+        self.out_path = Path(self.out_cfg.path)
+        self.out_path.mkdir(exist_ok=True, parents=True)
+        
+    def _add_post_processors(
+        self, video_stream: VideoStream, slam_output: SLAMOutput
+    ) -> ProcessedVideoStream:
+        assert slam_output.frame_intrinsics is not None
+        post_processors: list[StreamProcessor] = [
+            AssignAttributesProcessor(
+                {
+                    FrameAttribute.POSE: slam_output.get_trajectory(len(video_stream)),  # type: ignore
+                    FrameAttribute.INTRINSICS: list(slam_output.frame_intrinsics),
+                }
+            )
+        ]
+        return ProcessedVideoStream(video_stream, post_processors)
+
+    def _save_slam_output(self, artifact_path: io.ArtifactPath, slam_output: SLAMOutput) -> None:
+        artifact_path.pose_path.parent.mkdir(exist_ok=True, parents=True)
+
+        trajectory = slam_output.trajectory.data
+        if isinstance(trajectory, torch.Tensor):
+            trajectory = trajectory.cpu().numpy()
+
+        intrinsics = slam_output.intrinsics.cpu().numpy()
+        assert slam_output.frame_intrinsics is not None
+        frame_intrinsics = slam_output.frame_intrinsics.cpu().numpy()
+        log_scales = np.array([], dtype=np.float32)
+        if slam_output.log_scales is not None:
+            log_scales = slam_output.log_scales.cpu().numpy()
+        scales = np.exp(log_scales).astype(np.float32) if log_scales.size else np.array([], dtype=np.float32)
+        moge_log_scales = np.array([], dtype=np.float32)
+        if slam_output.moge_log_scales is not None:
+            moge_log_scales = slam_output.moge_log_scales.cpu().numpy()
+        moge_scales = (
+            np.exp(moge_log_scales).astype(np.float32)
+            if moge_log_scales.size
+            else np.array([], dtype=np.float32)
+        )
+        pgo_info = slam_output.pgo_info or {}
+        pose_edges = slam_output.pose_edges or {}
+        edge_np = {
+            f"edge_{key}": value.cpu().numpy()
+            for key, value in pose_edges.items()
+        }
+        frame_np = {}
+        if slam_output.frame_trajectory is not None:
+            frame_trajectory = slam_output.frame_trajectory.data
+            if isinstance(frame_trajectory, torch.Tensor):
+                frame_trajectory = frame_trajectory.cpu().numpy()
+            frame_np["frame_trajectory"] = frame_trajectory
+        if slam_output.frame_timestamps is not None:
+            frame_np["frame_timestamps"] = slam_output.frame_timestamps
+
+        np.savez_compressed(
+            artifact_path.pose_path,
+            trajectory=trajectory,
+            intrinsics=intrinsics,
+            frame_intrinsics=frame_intrinsics,
+            timestamps=slam_output.keyframe_ids,
+            log_scales=log_scales,
+            scales=scales,
+            moge_log_scales=moge_log_scales,
+            moge_scales=moge_scales,
+            pgo_info=np.array(json.dumps(pgo_info)),
+            **frame_np,
+            **edge_np,
+        )
+
+        if slam_output.depths is not None:
+            artifact_path.depth_npz_path.parent.mkdir(exist_ok=True, parents=True)
+            depth_payload = {
+                "depths": slam_output.depths.cpu().numpy(),
+                "timestamps": slam_output.keyframe_ids,
+            }
+            if slam_output.depth_masks is not None:
+                depth_payload["masks"] = slam_output.depth_masks.cpu().numpy()
+            if slam_output.depth_status is not None:
+                depth_payload["depth_status"] = slam_output.depth_status.cpu().numpy()
+            if slam_output.depth_dirty is not None:
+                depth_payload["depth_dirty"] = slam_output.depth_dirty.cpu().numpy()
+            np.savez_compressed(artifact_path.depth_npz_path, **depth_payload)
+    
+    def run(self, video_data: VideoStream) -> AnnotationPipelineOutput:
+        artifact_path = io.ArtifactPath(self.out_path, video_data.name())
+
+        annotate_output = AnnotationPipelineOutput()
+
+        if self.should_filter(video_data.name()):
+            logger.info(f"{video_data.name()} has been processed already, skip it!!")
+            return annotate_output
+
+        slam_stream = ProcessedVideoStream(video_data, []).cache("process", online=True)
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        slam_pipeline = SLAMSystem(device=device, config=self.slam_cfg)
+        slam_output = slam_pipeline.run(slam_stream)
+        self._save_slam_output(artifact_path, slam_output)
+
+        if self.return_payload:
+            annotate_output.payload = slam_output
+            return annotate_output
+
+        output_streams = [self._add_post_processors(slam_stream, slam_output).cache("depth", online=True)]
+        if self.return_output_streams:
+            annotate_output.output_streams = output_streams
+        return annotate_output

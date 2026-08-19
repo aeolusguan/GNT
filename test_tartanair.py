@@ -10,9 +10,8 @@ from pathlib import Path
 from typing import Sized
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import cv2
 import numpy as np
@@ -23,20 +22,20 @@ import torch.backends.cudnn as cudnn
 torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
 # network
-from geont.models import GeoNTWrapper
-from geont.data import get_data_loader
-from geont.data.factory import dataset_factory
-from geont.losses import MultitaskLoss
+from gent.model import GeNTWrapper
+from gent.data import get_data_loader
+from gent.data.tartan import TartanAir
+from gent.losses import MultitaskLoss
 
-from geont.geometry.graph_utils import build_frame_graph
+from gent.geometry.graph_utils import build_frame_graph
 
-import geont.utils.misc as misc
-from geont.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
+import gent.utils.misc as misc
+from gent.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 from alignment import align
-from geont.geometry.losses import pose_metrics
-from geont.geometry.graph_utils import graph_to_edge_list
-from geont.geometry.projective_ops import projective_transform, projective_transform_v2
+from gent.geometry.losses import pose_metrics
+from gent.geometry.graph_utils import graph_to_edge_list
+from gent.geometry.projective_ops import projective_transform, projective_transform_v2
 from lietorch import SE3, Sim3
 import matplotlib
 
@@ -56,7 +55,7 @@ def colorize_depth(depth: np.ndarray, mask: np.ndarray = None, normalize: bool =
 
 
 def get_args_parser():
-    parser = argparse.ArgumentParser('GeoNT Training', add_help=False)
+    parser = argparse.ArgumentParser('GeNT Training', add_help=False)
     # model
     parser.add_argument('--pretrained', default=None, help='path of a starting checkpoint')
     parser.add_argument('--fmin', type=float, default=8.0)
@@ -108,7 +107,7 @@ def get_args_parser():
 
 def load_model(args, device):
     # model
-    model = GeoNTWrapper()
+    model = GeNTWrapper()
     model.to(device)
     if args.pretrained and not args.resume:
         print('Loading pretrained: ', args.pretrained)
@@ -165,7 +164,7 @@ def evaluate(predictions, batch):
     pr_depth = predictions["depth"].flatten(0, 1)
     gt_depth = batch["depth"].flatten(0, 1)
     mono_pr_depth = predictions["mono_depth"].flatten(0, 1)
-    valid_mask = torch.logical_and(predictions["valid"], batch["valid"])
+    valid_mask = batch["valid"]
     valid_mask_flatten = valid_mask.flatten(0, 1)
 
     B = len(pr_depth)
@@ -238,7 +237,12 @@ if __name__ == "__main__":
     model = load_model(args, device)
     
     # fetch dataloader
-    db = dataset_factory(['tartan'], datapath=args.datapath, n_frames=args.n_frames, fmin=args.fmin, fmax=args.fmax)
+    db = TartanAir(
+        datapath=args.datapath,
+        n_frames=args.n_frames,
+        fmin=args.fmin,
+        fmax=args.fmax,
+    )
     data_loader = get_data_loader(db, batch_size=args.batch_size, num_workers=args.num_workers, pin_mem=True, shuffle=True, drop_last=True)
     print("train dataset length: ", len(data_loader))
 
@@ -273,7 +277,18 @@ if __name__ == "__main__":
         # poses w2c
         images, poses, depths, depths_valid, intrinsics = [x.to(device) for x in batch]
 
-        graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
+        disps = torch.where(
+            depths_valid,
+            depths.reciprocal(),
+            torch.zeros_like(depths),
+        )
+        graph = build_frame_graph(
+            poses,
+            disps,
+            intrinsics,
+            valid=depths_valid,
+            num=args.edges,
+        )
 
         with torch.no_grad():
             prediction = model(images, intrinsics, graph, depths, depths_valid, poses, use_fp16=bool(args.amp))

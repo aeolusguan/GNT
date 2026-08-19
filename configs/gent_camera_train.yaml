@@ -1,0 +1,29 @@
+defaults:
+  - gent_train
+  - _self_
+
+epochs: 40
+warmup_epochs: 3
+lr: 5.0e-5
+min_lr: 1.0e-6
+batch_size: 1
+accum_iter: 2
+amp: 1
+n_frames: 6
+edges: 18
+save_freq: 1
+keep_freq: 50
+output_dir: ./output_camera_prior/
+
+init:
+  checkpoint: output/checkpoint-last-stable.pth
+  da3:
+    path: depth-anything/DA3-BASE
+
+model:
+  gnt:
+    camera_encoder:
+      trunk_depth: 4
+      num_heads: 16
+      mlp_ratio: 4
+      init_values: 0.01

@@ -12,61 +12,113 @@ import torch
 import torch.backends.cudnn as cudnn
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
-torch.backends.cuda.matmul.allow_tf32 = True  # for gpu >= Ampere and pytorch >= 1.12
 
-from geont.models.geont import GeoNTWrapper
-from geont.data import get_data_loader
-from geont.data.factory import dataset_factory
-from geont.losses import MultitaskLoss
+from gent.model.gent import GeNTWrapper
+from gent.data import get_data_loader
+from gent.data.factory import dataset_factory
+from gent.losses import MultitaskLoss
 
-from geont.geometry.graph_utils import build_frame_graph
+from gent.geometry.graph_utils import build_frame_graph
 
-import geont.utils.misc as misc
-from geont.utils.misc import NativeScalerWithGradNormCount as NativeScaler
+import gent.utils.misc as misc
+from gent.utils.misc import NativeScalerWithGradNormCount as NativeScaler
+
+
+torch.backends.cuda.matmul.allow_tf32 = True
+
+
+def load_da3_state(source: str | Path):
+    from safetensors.torch import load_file
+
+    source = Path(source)
+    if source.exists():
+        weight_path = source / "model.safetensors" if source.is_dir() else source
+    else:
+        from huggingface_hub import hf_hub_download
+
+        weight_path = Path(hf_hub_download(repo_id=str(source), filename="model.safetensors"))
+    return load_file(weight_path, device="cpu"), weight_path
+
+
+def load_da3_model_weights(model: GeNTWrapper, source: str | Path) -> None:
+    da3_state, weight_path = load_da3_state(source)
+    update_state = {}
+    for key, value in da3_state.items():
+        if key.startswith("model.backbone."):
+            update_state[f"backbone.{key.removeprefix('model.backbone.')}"] = value
+        elif key.startswith("model.cam_dec."):
+            update_state[f"cam_dec.{key.removeprefix('model.cam_dec.')}"] = value
+        elif model.gnt.cam_enc is not None and key.startswith("model.cam_enc."):
+            update_state[f"cam_enc.{key.removeprefix('model.cam_enc.')}"] = value
+    load_report = model.gnt.load_state_dict(update_state, strict=False)
+    print(f"DA3 init from {weight_path}")
+    print(f"Missing DA3 init parameters: {load_report.missing_keys}")
+    print(f"Unexpected DA3 init parameters: {load_report.unexpected_keys}")
+
+
+def load_da3_camera_encoder(model: GeNTWrapper, source: str | Path) -> None:
+    da3_state, weight_path = load_da3_state(source)
+    camera_state = {
+        key.removeprefix("model.cam_enc."): value
+        for key, value in da3_state.items()
+        if key.startswith("model.cam_enc.")
+    }
+    model.gnt.cam_enc.load_state_dict(camera_state)
+    print(f"Camera encoder init from {weight_path}")
+
+
+def load_initial_checkpoint(model: GeNTWrapper, checkpoint_path: str | Path) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    load_report = model.load_state_dict(checkpoint["model"], strict=False)
+    allowed_missing = set()
+    if model.gnt.cam_enc is not None:
+        allowed_missing = {
+            f"gnt.cam_enc.{key}"
+            for key in model.gnt.cam_enc.state_dict()
+        }
+    if set(load_report.missing_keys) != allowed_missing or load_report.unexpected_keys:
+        raise RuntimeError(
+            "Invalid weights-only initialization: "
+            f"missing={load_report.missing_keys}, unexpected={load_report.unexpected_keys}"
+        )
+    print(f"Model init from {checkpoint_path}")
 
 
 def build_training_model(args, device):
-    model = GeoNTWrapper(args.model.gnt)
+    model = GeNTWrapper(args.model.gnt)
     model.to(device)
-    if args.pose_prior_train_prob <= 0.0:
-        for param in model.gnt.cam_enc.parameters():
-            param.requires_grad = False
     model_without_ddp = model
     if args.resume is None:
-        from safetensors.torch import load_file
-
-        da3_path = Path(args.init.da3.path)
-        if da3_path.exists():
-            weight_path = da3_path / "model.safetensors" if da3_path.is_dir() else da3_path
+        if args.init.checkpoint is None:
+            load_da3_model_weights(model, args.init.da3.path)
         else:
-            from huggingface_hub import hf_hub_download
-
-            weight_path = Path(hf_hub_download(repo_id=args.init.da3.path, filename="model.safetensors"))
-        da3_state = load_file(weight_path, device="cpu")
-        update_state = {}
-        for key, value in da3_state.items():
-            if key.startswith("model.backbone."):
-                update_state[f"backbone.{key.removeprefix('model.backbone.')}"] = value
-            elif key.startswith("model.cam_dec."):
-                update_state[f"cam_dec.{key.removeprefix('model.cam_dec.')}"] = value
-        load_report = model.gnt.load_state_dict(update_state, strict=False)
-        print(f"DA3 init from {weight_path}")
-        print(f"Missing DA3 init parameters: {load_report.missing_keys}")
-        print(f"Unexpected DA3 init parameters: {load_report.unexpected_keys}")
+            load_initial_checkpoint(model, args.init.checkpoint)
+            if model.gnt.cam_enc is not None:
+                load_da3_camera_encoder(model, args.init.da3.path)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[args.gpu], find_unused_parameters=False, static_graph=True
+            model,
+            device_ids=[args.gpu],
+            find_unused_parameters=False,
+            static_graph=True,
+            gradient_as_bucket_view=True,
         )
         model_without_ddp = model.module
-    
+
     return model, model_without_ddp
 
 
 def train(args):
     args.output_dir = to_absolute_path(args.output_dir)
-    args.datapath = to_absolute_path(args.datapath)
+    args.data.tartanair.root = to_absolute_path(args.data.tartanair.root)
+    args.data.arkitscenes.root = to_absolute_path(args.data.arkitscenes.root)
+    args.data.dynamic_replica.root = to_absolute_path(
+        args.data.dynamic_replica.root
+    )
     if args.resume is not None:
         args.resume = to_absolute_path(args.resume)
+    if args.init.checkpoint is not None:
+        args.init.checkpoint = to_absolute_path(args.init.checkpoint)
 
     misc.init_distributed_mode(args)
 
@@ -88,7 +140,12 @@ def train(args):
 
     model, model_without_ddp = build_training_model(args, device)
     
-    db = dataset_factory(['tartan'], datapath=args.datapath, n_frames=args.n_frames, fmin=args.fmin, fmax=args.fmax)
+    db = dataset_factory(
+        args.data,
+        n_frames=args.n_frames,
+        fmin=args.fmin,
+        fmax=args.fmax,
+    )
     data_loader_train = get_data_loader(db, batch_size=args.batch_size, num_workers=args.num_workers, pin_mem=True, shuffle=True, drop_last=True)
     print("train dataset length: ", len(data_loader_train))
 
@@ -177,7 +234,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     data_loader.dataset.set_epoch(epoch)
     data_loader.sampler.set_epoch(epoch)
 
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=True)
 
     for data_iter_step, batch in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         epoch_f = epoch + data_iter_step / len(data_loader)
@@ -186,10 +243,23 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if data_iter_step % accum_iter == 0:
             misc.adjust_learning_rate(optimizer, epoch_f, args)
 
-        # poses w2c
-        images, poses, depths, depths_valid, intrinsics = [x.to(device) for x in batch]
-
-        graph = build_frame_graph(poses, 1.0 / depths, intrinsics, num=args.edges)
+        # Build the frame graph from the CPU batch before transferring training tensors.
+        images, poses, depths, depths_valid, intrinsics = batch
+        disps = torch.where(
+            depths_valid,
+            depths.reciprocal(),
+            torch.zeros_like(depths),
+        )
+        graph = build_frame_graph(
+            poses,
+            disps,
+            intrinsics,
+            valid=depths_valid,
+            num=args.edges,
+        )
+        images, poses, depths, depths_valid, intrinsics = [
+            x.to(device, non_blocking=True) for x in batch
+        ]
 
         prediction = model(
             images,
@@ -197,7 +267,6 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             graph,
             depths_valid,
             use_fp16=bool(args.amp),
-            pose_prior_args=args,
         )
 
         with torch.cuda.amp.autocast(enabled=False):
@@ -215,12 +284,12 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value), force=True)
             sys.exit(1)
-        
+
         loss /= accum_iter
         loss_scaler(loss, optimizer, parameters=model.parameters(),
                     update_grad=(data_iter_step + 1) % accum_iter == 0)
         if (data_iter_step + 1) % accum_iter == 0:
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
         
         del loss
         del prediction
@@ -237,7 +306,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
-@hydra.main(version_base=None, config_path="configs", config_name="geont_train")
+@hydra.main(version_base=None, config_path="configs", config_name="gent_train")
 def main(args: DictConfig) -> None:
     train(args)
 

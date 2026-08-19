@@ -13,14 +13,13 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from geont_runtime.inference import build_streaming_config
+from gent.runtime.inference import build_streaming_config
 from lietorch import SE3
-from geont_runtime.pipeline.default import DefaultAnnotationPipeline
-from geont_runtime.streams.frame_dir_stream import FrameDirStream
+from gent.runtime.pipeline.default import DefaultAnnotationPipeline
+from gent.runtime.streams.frame_dir_stream import FrameDirStream
 
 
 def _config_path(value) -> Path:

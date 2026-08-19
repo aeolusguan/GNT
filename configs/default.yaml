@@ -1,5 +1,5 @@
 streams:
-  instance: geont_runtime.streams.frame_dir_stream.FrameDirStreamList
+  instance: gent.runtime.streams.frame_dir_stream.FrameDirStreamList
   base_path: ???
   frame_start: 0
   frame_end: -1
@@ -7,14 +7,14 @@ streams:
   cached: false
 
 pipeline:
-  instance: geont_runtime.pipeline.default.DefaultAnnotationPipeline
+  instance: gent.runtime.pipeline.default.DefaultAnnotationPipeline
   init: {}
   post: {}
   output:
     path: outputs
   slam:
     ckpt_path: ???
-    intrinsics: ???
+    intrinsics: ???  # [F, 4] per selected frame, or [4] for a fixed camera
     visualize: false
     buffer: 512
     pgo_iters: 12
@@ -35,5 +35,4 @@ pipeline:
     local_mapping_nms: 1
     local_mapping_thresh: 16.0
     local_pgo_every: 10
-    tracking_multiview_neighbors: 2
     use_fp16: true

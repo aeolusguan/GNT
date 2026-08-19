@@ -1,5 +1,5 @@
 tartanair_root: datasets/TartanAir
-split: src/geont/data/tartan_test.txt
+split: gent/data/tartan_test.txt
 ckpt: ???
 output: outputs/tartanair_pgo_eval
 
@@ -30,5 +30,4 @@ slam:
   local_mapping_nms: 1
   local_mapping_thresh: 16.0
   local_pgo_every: 10
-  tracking_multiview_neighbors: 2
   use_fp16: true

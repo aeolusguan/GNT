@@ -9,10 +9,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-sys.path.append(str(SRC / "geont" / "models" / "flow"))
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+sys.path.append(str(ROOT / "gent" / "model" / "flow"))
 import argparse
 import numpy as np
 
@@ -26,7 +25,7 @@ import core.datasets as datasets
 from core.model import FlowModel
 from tqdm import tqdm
 from core.utils.utils import load_ckpt
-from geont.models.external import load_moge
+from gent.model.external import load_moge
 
 def forward_flow(args, model, mono, image1, image2):
     depth_predictions = mono.infer(image1 / 255.0)
