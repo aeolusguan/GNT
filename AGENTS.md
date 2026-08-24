@@ -154,13 +154,13 @@ Depth and scale convention:
   normalized depth from `buffer.depths_sens_normed` or the uncommitted
   `KeyframeCandidate` MoGe depth before frontend writes tracking refined depth.
   Never feed `buffer.depths` refined/published depth back into GeNT.
-- MoGe inference uses `apply_mask=False`. The non-sky mask defines depth
-  normalization statistics and remains an explicit validity channel, but it
-  must not zero the normalized MoGe depth outside the mask. During training,
-  dataset-valid pixels supervise depth and projection-flow losses even when
-  MoGe marks those pixels as sky; the MoGe/GT intersection is used only for
-  the normalized-depth gauge. Depth-derived flow bases use reciprocal MoGe
-  depth at every pixel and do not zero disparity outside the non-sky mask.
+- MoGe inference uses `apply_mask=False`, so the raw prediction is retained at
+  every pixel. During training, the predicted non-sky mask intersected with
+  dataset validity defines both the MoGe-prior and GT-depth mean-normalization
+  support. During inference, the predicted non-sky mask defines the prior
+  support. The active support remains an explicit depth-token channel, but it
+  does not zero normalized MoGe depth outside the support. Depth-derived flow
+  bases use reciprocal MoGe depth at every pixel.
 - Training depth regression and confidence use uniform GT-valid pixel
   weighting. The 98% depth-loss quantile filtering suppresses noisy
   supervision.

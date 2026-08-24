@@ -112,9 +112,8 @@ class MultitaskLoss(torch.nn.Module):
         pr_relative_log_scale = edge_measurements[..., 9]
         pr_scale_confidence = edge_measurements[..., 10]
         gt_depth = batch["depth"]
-        # The MoGe mask defines only the normalized-depth gauge. Dataset-valid
-        # pixels supervise depth and projection flow, including near-sky pixels
-        # rejected by MoGe.
+        # The MoGe non-sky mask and dataset validity jointly define the shared
+        # normalized-depth gauge. Dataset-valid pixels remain supervised.
         normalization_mask = predictions["normalization_mask"]
         valid_mask = batch["valid"]
         gt_disps = torch.where(
@@ -123,8 +122,6 @@ class MultitaskLoss(torch.nn.Module):
             torch.zeros_like(gt_depth),
         )
 
-        # Normalize with the non-sky gauge while retaining targets everywhere
-        # that the dataset provides valid depth.
         gt_depth_target, gt_scale = normalize_depth(
             gt_depth.flatten(0, 1),
             normalization_mask.flatten(0, 1),
@@ -227,9 +224,11 @@ class MultitaskLoss(torch.nn.Module):
     def compute_depth_loss(self, pr_depth, gt_depth_target, depth_conf, valid_mask, alpha=0.2):
         depth_reg_loss = torch.abs(pr_depth - gt_depth_target)
         depth_reg_loss = depth_reg_loss[valid_mask]
+        valid_gt_depth = gt_depth_target[valid_mask]
+        depth_weight = 1.0 + valid_gt_depth.clamp_min(0.1).reciprocal()
 
         depth_conf_loss = (
-            depth_reg_loss * depth_conf[valid_mask]
+            depth_weight * depth_reg_loss * depth_conf[valid_mask]
             - alpha * torch.log(depth_conf[valid_mask])
         )
         depth_conf_loss = sanitize_loss(depth_conf_loss)

@@ -384,12 +384,11 @@ class GeNTWrapper(nn.Module):
         # Front end
         flow_predictions, depth_predictions = self._frontend_forward(images, intrinsics, graph)
         mono_depths = depth_predictions["depth"]
-        valid = depth_predictions["mask"]
+        non_sky_mask = depth_predictions["mask"]
 
-        # mono_depths/valid: [S,H,W]; gt_depth_valid: [1,S,H,W].
-        # The mask defines the input depth gauge and remains an explicit validity
-        # channel. Normalized MoGe values outside it are retained.
-        normalization_mask = valid & gt_depth_valid[0]
+        # MoGe's non-sky prediction and dataset validity define the shared
+        # training gauge. Normalized MoGe values outside it are retained.
+        normalization_mask = non_sky_mask & gt_depth_valid[0]
         scaled_depth, scale = self.normalize_depth(mono_depths, normalization_mask)
 
         flow_final, info_final = flow_predictions["flow"][-1], flow_predictions["info"][-1]

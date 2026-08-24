@@ -8,9 +8,9 @@ initializer, offline frontend sweep, or full-sequence backend proximity pass.
 
 For each incoming frame, `SLAMSystem` builds an uncommitted
 `KeyframeCandidate` containing GeNT features, MoGe-normalized depth, the fixed
-raw MoGe scale, a valid-depth mask, a cached depth/validity patch token, and flow
-bases. The patch embedders allocate `D/4` to normalized depth plus validity and
-`3D/4` to motion.
+raw MoGe scale, its non-sky normalization mask, a cached depth/mask patch token,
+and flow bases. The patch embedders allocate `D/4` to normalized depth plus
+validity and `3D/4` to motion.
 
 The first frame is accepted directly. Every later frame runs GeNT tracking
 aggregation against up to `local_mapping_radius` previous keyframes.
