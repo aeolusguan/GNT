@@ -138,7 +138,7 @@ def main(args):
                             pr_depth,
                             gt_depth,
                             max_depth=70,
-                            align_with_scale=True,
+                            # align_with_scale=True,
                             use_gpu=True,
                             post_clip_max=70,
                         )
@@ -184,23 +184,24 @@ def main(args):
             depth[depth_png == 0] = -1.0
             return depth
 
-        seq_list = ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"]
+        # seq_list = ["balloon2", "crowd2", "crowd3", "person_tracking2", "synchronous"]
 
-        img_pathes_folder = [
-            f"data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/rgb_110/*.png"
-            for seq in seq_list
-        ]
-        img_pathes = []
-        for img_pathes_folder_i in img_pathes_folder:
-            img_pathes += glob.glob(img_pathes_folder_i)
-        img_pathes = sorted(img_pathes)
-        depth_pathes_folder = [
-            f"data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/depth_110/*.png"
-            for seq in seq_list
-        ]
-        depth_pathes = []
-        for depth_pathes_folder_i in depth_pathes_folder:
-            depth_pathes += glob.glob(depth_pathes_folder_i)
+        # img_pathes_folder = [
+        #     f"data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/rgb_110/*.png"
+        #     for seq in seq_list
+        # ]
+        # img_pathes = []
+        # for img_pathes_folder_i in img_pathes_folder:
+        #     img_pathes += glob.glob(img_pathes_folder_i)
+        # img_pathes = sorted(img_pathes)
+        # depth_pathes_folder = [
+        #     f"data/bonn/rgbd_bonn_dataset/rgbd_bonn_{seq}/depth_110/*.png"
+        #     for seq in seq_list
+        # ]
+        # depth_pathes = []
+        # for depth_pathes_folder_i in depth_pathes_folder:
+        #     depth_pathes += glob.glob(depth_pathes_folder_i)
+        depth_pathes = glob.glob("data/bonn/rgbd_bonn_dataset/rgbd_bonn_*/depth_110/*.png")
         depth_pathes = sorted(depth_pathes)
         pred_pathes = glob.glob(
             f"{args.output_dir}/*/frame*.npy"
@@ -212,7 +213,7 @@ def main(args):
             grouped_gt_depth = group_by_directory(depth_pathes, idx=-2)
             gathered_depth_metrics = []
             for key in tqdm(grouped_gt_depth.keys()):
-                pd_pathes = grouped_pred_depth[key[10:]]
+                pd_pathes = grouped_pred_depth[key]
                 gt_pathes = grouped_gt_depth[key]
                 gt_depth = np.stack(
                     [depth_read(gt_path) for gt_path in gt_pathes], axis=0

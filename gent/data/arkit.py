@@ -11,8 +11,6 @@ from .base import RGBDDataset
 class ARKitScenes(RGBDDataset):
     """ARKitScenes training sequences in the CUT3R processed layout."""
 
-    z_far = 10.0
-
     def __init__(self, **kwargs):
         super().__init__(name="ARKitScenes", **kwargs)
 
@@ -71,5 +69,6 @@ class ARKitScenes(RGBDDataset):
     def depth_read(depth_file):
         depth = cv2.imread(depth_file, cv2.IMREAD_UNCHANGED).astype(np.float32)
         depth /= 1000.0
-        valid = np.isfinite(depth) & (depth > 0)
+        depth[~np.isfinite(depth)] = 0.0
+        valid = depth > 0.0
         return depth, valid

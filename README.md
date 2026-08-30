@@ -53,16 +53,34 @@ The flow frontend expects:
 checkpoints/flow_T_TartanCT_TSKH.pth
 ```
 
-Training defaults expect TartanAir-style data under:
+Training uses a fixed TartanAir, ARKitScenes, Dynamic Replica, PointOdyssey,
+and Waymo mixture. The default roots are:
 
 ```text
 datasets/TartanAir
+datasets/ARKitScenes_processed
+datasets/dynamic_replica
+datasets/pointo_processed
+datasets/waymo/processed_data
 ```
+
+PointOdyssey and Waymo use the CUT3R processed layouts. PointOdyssey contains
+`train/<scene>/{rgb,depth,cam}`; Waymo contains one directory per segment with
+`<frame>_<camera>.{jpg,exr,npz}` and a root `invalid_files.h5`. Waymo cache
+generation requires `h5py`, and OpenCV's OpenEXR codec is enabled by its loader.
 
 Dataset index caches are written under:
 
 ```text
 gent/data/cache/
+```
+
+Prepare the non-TartanAir caches before starting training:
+
+```bash
+python scripts/prepare_training_caches.py \
+  /path/to/pointo_processed \
+  /path/to/waymo/processed_data
 ```
 
 ## Streaming inference
@@ -139,6 +157,10 @@ python training.py \
   --config-name=gent_train \
   init.da3.path=depth-anything/DA3-BASE \
   data.tartanair.root=datasets/TartanAir \
+  data.arkitscenes.root=datasets/ARKitScenes_processed \
+  data.dynamic_replica.root=datasets/dynamic_replica \
+  data.point_odyssey.root=datasets/pointo_processed \
+  data.waymo.root=datasets/waymo/processed_data \
   output_dir=output/gent_train
 ```
 

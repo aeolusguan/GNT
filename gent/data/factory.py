@@ -1,31 +1,31 @@
 from .arkit import ARKitScenes
 from .dynamic_replica import DynamicReplica
+from .point_odyssey import PointOdyssey
 from .tartan import TartanAir
+from .waymo import Waymo
+
+
+DATASET_CLASSES = {
+    "tartanair": TartanAir,
+    "arkitscenes": ARKitScenes,
+    "dynamic_replica": DynamicReplica,
+    "point_odyssey": PointOdyssey,
+    "waymo": Waymo,
+}
 
 
 def dataset_factory(dataset_config, **kwargs):
-    """Create the fixed three-dataset training mixture."""
-    tartan_config = dataset_config.tartanair
-    arkit_config = dataset_config.arkitscenes
-    dynamic_config = dataset_config.dynamic_replica
-    tartan = TartanAir(datapath=tartan_config.root, **kwargs)
-    arkit = ARKitScenes(datapath=arkit_config.root, **kwargs)
-    dynamic = DynamicReplica(datapath=dynamic_config.root, **kwargs)
+    """Create the training mixture described by the YAML data section."""
+    weighted_datasets = []
+    for name, config in dataset_config.items():
+        dataset = DATASET_CLASSES[name](datapath=config.root, **kwargs)
+        print(
+            f"{dataset.name} has {len(dataset)} samples; "
+            f"sampling {config.samples_per_epoch} each epoch"
+        )
+        weighted_datasets.append(config.samples_per_epoch @ dataset)
 
-    print(
-        f"TartanAir has {len(tartan)} samples; "
-        f"sampling {tartan_config.samples_per_epoch} each epoch"
-    )
-    print(
-        f"ARKitScenes has {len(arkit)} samples; "
-        f"sampling {arkit_config.samples_per_epoch} each epoch"
-    )
-    print(
-        f"Dynamic Replica has {len(dynamic)} samples; "
-        f"sampling {dynamic_config.samples_per_epoch} each epoch"
-    )
-    return (
-        tartan_config.samples_per_epoch @ tartan
-        + arkit_config.samples_per_epoch @ arkit
-        + dynamic_config.samples_per_epoch @ dynamic
-    )
+    mixture = weighted_datasets[0]
+    for dataset in weighted_datasets[1:]:
+        mixture = mixture + dataset
+    return mixture

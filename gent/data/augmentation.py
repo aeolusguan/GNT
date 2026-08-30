@@ -21,22 +21,35 @@ class RGBDAugmentor:
         """ Cropping and resizing """
         ht, wd = images.shape[2:]
 
-        max_scale = self.max_scale
-        min_scale = np.log2(np.maximum(
+        required_scale = np.maximum(
             (self.crop_size[0] + 1) / float(ht),
-            (self.crop_size[1] + 1) / float(wd)))
-        
-        scale = 2 ** np.random.uniform(min_scale, max_scale)
-        intrinsics = scale * intrinsics
+            (self.crop_size[1] + 1) / float(wd)
+        )
+        min_log_scale = min(np.log2(required_scale), self.max_scale)
+        scale = 2 ** np.random.uniform(min_log_scale, self.max_scale)
+        scale = max(scale, required_scale)
+
         depths = depths.unsqueeze(dim=1)
         depths_valid = depths_valid.unsqueeze(dim=1)
 
-        images = F.interpolate(images, scale_factor=scale, mode='bilinear',
-                               align_corners=False, recompute_scale_factor=True)
-        
-        depths = F.interpolate(depths, scale_factor=scale, recompute_scale_factor=True)
-        depths_valid = F.interpolate(depths_valid.float(), scale_factor=scale, recompute_scale_factor=True) > 0.5
-
+        intrinsics = scale * intrinsics
+        images = F.interpolate(
+            images,
+            scale_factor=scale,
+            mode="bilinear",
+            align_corners=False,
+            recompute_scale_factor=True,
+        )
+        depths = F.interpolate(
+            depths,
+            scale_factor=scale,
+            recompute_scale_factor=True,
+        )
+        depths_valid = F.interpolate(
+            depths_valid.float(),
+            scale_factor=scale,
+            recompute_scale_factor=True,
+        ) > 0.5
         # always perform center crop (TODO: try non-center crops)
         y0 = (images.shape[2] - self.crop_size[0]) // 2
         x0 = (images.shape[3] - self.crop_size[1]) // 2
@@ -45,9 +58,9 @@ class RGBDAugmentor:
         images = images[:, :, y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         depths = depths[:, :, y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
         depths_valid = depths_valid[:, :, y0:y0+self.crop_size[0], x0:x0+self.crop_size[1]]
-
         depths = depths.squeeze(dim=1)
         depths_valid = depths_valid.squeeze(dim=1)
+
         return images, poses, depths, depths_valid, intrinsics
     
     def color_transform(self, images):

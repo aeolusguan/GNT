@@ -159,8 +159,11 @@ Depth and scale convention:
   dataset validity defines both the MoGe-prior and GT-depth mean-normalization
   support. During inference, the predicted non-sky mask defines the prior
   support. The active support remains an explicit depth-token channel, but it
-  does not zero normalized MoGe depth outside the support. Depth-derived flow
-  bases use reciprocal MoGe depth at every pixel.
+  does not zero normalized MoGe depth outside the support. The runtime cutoff
+  is the maximum of a configured metric floor and the configured quantile of
+  each frame's non-sky MoGe depths. This preserves the established near-depth
+  support while adapting to scenes whose predicted depths shift farther away.
+  Depth-derived flow bases use reciprocal raw MoGe depth at every pixel.
 - Training depth regression and confidence use uniform GT-valid pixel
   weighting. The 98% depth-loss quantile filtering suppresses noisy
   supervision.

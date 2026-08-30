@@ -47,6 +47,18 @@ def get_args_parser() -> argparse.ArgumentParser:
         help="stride for video depth evaluation",
     )
     parser.add_argument(
+        "--depth_normalization_min_cutoff",
+        default=80.0,
+        type=float,
+        help="minimum runtime cutoff for non-sky MoGe depth normalization",
+    )
+    parser.add_argument(
+        "--depth_normalization_quantile",
+        default=0.8,
+        type=float,
+        help="fraction of non-sky MoGe depths used for runtime normalization",
+    )
+    parser.add_argument(
         "--full_seq",
         action="store_true",
         default=False,
@@ -128,10 +140,15 @@ def eval_pose_estimation_dist(args, img_path, save_dir=None, mask_path=None) -> 
             )
             filelist = stream.frame_files[stream.start : stream.end : stream.step]
             intrinsics = load_video_intrinsics(args.eval_dataset, seq, filelist)
+            slam_overrides = {
+                "depth_normalization_min_cutoff": args.depth_normalization_min_cutoff,
+                "depth_normalization_quantile": args.depth_normalization_quantile,
+            }
             slam_config = build_streaming_config(
                 frame_dir,
                 args.weights,
                 intrinsics.tolist(),
+                slam_config=slam_overrides,
             ).pipeline.slam
 
             system = SLAMSystem(device=device, config=slam_config)

@@ -214,6 +214,41 @@ def induced_flow(poses, disps, intrinsics, ii, jj):
     return coords1[..., :2] - coords0, valid
 
 
+def induced_flow_sparse(poses, coords, depths, intrinsics, ii, jj):
+    """Optical flow for arbitrary sampled pixels using the projective path."""
+    fx = intrinsics[..., 0]
+    fy = intrinsics[..., 1]
+    cx = intrinsics[..., 2]
+    cy = intrinsics[..., 3]
+    x, y = coords.unbind(dim=-1)
+    disparity = torch.where(
+        depths > 0,
+        depths.clamp_min(1e-6).reciprocal(),
+        torch.zeros_like(depths),
+    )
+    points = torch.stack(
+        [
+            (x - cx[..., None]) / fx[..., None],
+            (y - cy[..., None]) / fy[..., None],
+            torch.ones_like(depths),
+            disparity,
+        ],
+        dim=-1,
+    )
+
+    transform = poses[:, jj] * poses[:, ii].inv()
+    points, _ = actp(transform, points[:, ii, None])
+    points = points.squeeze(2)
+    projected, _ = proj(
+        points[:, :, None],
+        intrinsics[:, jj],
+        return_depth=False,
+    )
+    projected = projected.squeeze(2)
+    valid = (points[..., 2] > MIN_DEPTH).unsqueeze(-1)
+    return projected - coords[:, ii], valid
+
+
 def projective_transform_v2(
     poses: SE3,  # [B,E]
     depths: torch.Tensor,  # [B,S,H,W]

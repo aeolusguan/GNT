@@ -67,7 +67,7 @@ def load_da3_camera_encoder(model: GeNTWrapper, source: str | Path) -> None:
     print(f"Camera encoder init from {weight_path}")
 
 
-def load_initial_checkpoint(model: GeNTWrapper, checkpoint_path: str | Path) -> None:
+def load_initial_checkpoint(model: GeNTWrapper, checkpoint_path: str | Path) -> set[str]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     load_report = model.load_state_dict(checkpoint["model"], strict=False)
     allowed_missing = set()
@@ -76,12 +76,14 @@ def load_initial_checkpoint(model: GeNTWrapper, checkpoint_path: str | Path) -> 
             f"gnt.cam_enc.{key}"
             for key in model.gnt.cam_enc.state_dict()
         }
-    if set(load_report.missing_keys) != allowed_missing or load_report.unexpected_keys:
+    missing_keys = set(load_report.missing_keys)
+    if not missing_keys.issubset(allowed_missing) or load_report.unexpected_keys:
         raise RuntimeError(
             "Invalid weights-only initialization: "
             f"missing={load_report.missing_keys}, unexpected={load_report.unexpected_keys}"
         )
     print(f"Model init from {checkpoint_path}")
+    return missing_keys
 
 
 def build_training_model(args, device):
@@ -92,8 +94,8 @@ def build_training_model(args, device):
         if args.init.checkpoint is None:
             load_da3_model_weights(model, args.init.da3.path)
         else:
-            load_initial_checkpoint(model, args.init.checkpoint)
-            if model.gnt.cam_enc is not None:
+            missing_keys = load_initial_checkpoint(model, args.init.checkpoint)
+            if model.gnt.cam_enc is not None and missing_keys:
                 load_da3_camera_encoder(model, args.init.da3.path)
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(
@@ -110,11 +112,8 @@ def build_training_model(args, device):
 
 def train(args):
     args.output_dir = to_absolute_path(args.output_dir)
-    args.data.tartanair.root = to_absolute_path(args.data.tartanair.root)
-    args.data.arkitscenes.root = to_absolute_path(args.data.arkitscenes.root)
-    args.data.dynamic_replica.root = to_absolute_path(
-        args.data.dynamic_replica.root
-    )
+    for dataset_config in args.data.values():
+        dataset_config.root = to_absolute_path(dataset_config.root)
     if args.resume is not None:
         args.resume = to_absolute_path(args.resume)
     if args.init.checkpoint is not None:
@@ -267,6 +266,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             graph,
             depths_valid,
             use_fp16=bool(args.amp),
+            depth_normalization_min_cutoff=args.depth_normalization_min_cutoff,
+            depth_normalization_quantile=args.depth_normalization_quantile,
         )
 
         with torch.cuda.amp.autocast(enabled=False):

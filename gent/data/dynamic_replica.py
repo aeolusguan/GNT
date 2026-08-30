@@ -11,8 +11,6 @@ from .base import RGBDDataset
 class DynamicReplica(RGBDDataset):
     """Dynamic Replica sequences in the CUT3R processed layout."""
 
-    z_far = 10.0
-
     def __init__(self, **kwargs):
         super().__init__(name="DynamicReplica", **kwargs)
 

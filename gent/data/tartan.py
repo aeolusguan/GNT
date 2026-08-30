@@ -16,14 +16,32 @@ test_split = open(test_split).read().split()
 
 
 class TartanAir(RGBDDataset):
-
-    z_far = 80
-    
-    # scale depth to balance rot & trans
     DEPTH_SCALE = 1.0
 
     def __init__(self, **kwargs):
         super().__init__(name="TartanAir", **kwargs)
+
+    @staticmethod
+    def scene_names(root):
+        return sorted(glob.glob(osp.join(str(root), '*/*/*')))
+
+    @classmethod
+    def build_scene(cls, root, scene):
+        images = sorted(glob.glob(osp.join(scene, 'image_left/*.png')))
+        depths = sorted(glob.glob(osp.join(scene, 'depth_left/*.npy')))
+
+        poses = np.loadtxt(osp.join(scene, 'pose_left.txt'), delimiter=' ')
+        poses = poses[:, [1, 2, 0, 4, 5, 3, 6]]
+        poses[:, :3] /= cls.DEPTH_SCALE
+        intrinsics = [cls.calib_read()] * len(images)
+        graph = cls.build_frame_graph(poses, depths, intrinsics)
+        return {
+            'images': images,
+            'depths': depths,
+            'poses': poses,
+            'intrinsics': intrinsics,
+            'graph': graph,
+        }
 
     @staticmethod
     def is_test_scene(scene):
@@ -33,24 +51,10 @@ class TartanAir(RGBDDataset):
     def _build_dataset(self):
         from tqdm import tqdm
         print("Building TartanAir dataset")
-    
+
         scene_info = {}
-        scenes = glob.glob(osp.join(self.root, '*/*/*'))
-        for scene in tqdm(sorted(scenes)):
-            images = sorted(glob.glob(osp.join(scene, 'image_left/*.png')))
-            depths = sorted(glob.glob(osp.join(scene, 'depth_left/*.npy')))
-            
-            poses = np.loadtxt(osp.join(scene, 'pose_left.txt'), delimiter=' ')
-            poses = poses[:, [1, 2, 0, 4, 5, 3, 6]]
-            poses[:,:3] /= TartanAir.DEPTH_SCALE
-            intrinsics = [TartanAir.calib_read()] * len(images)
-
-            # graph of co-visible frames based on flow
-            graph = self.build_frame_graph(poses, depths, intrinsics)
-
-            scene = '/'.join(scene.split('/'))
-            scene_info[scene] = {'images': images, 'depths': depths, 
-                'poses': poses, 'intrinsics': intrinsics, 'graph': graph}
+        for scene in tqdm(self.scene_names(self.root)):
+            scene_info[scene] = self.build_scene(self.root, scene)
 
         return scene_info
     
@@ -64,11 +68,21 @@ class TartanAir(RGBDDataset):
     
     @staticmethod
     def depth_read(depth_file):
-        depth = np.load(depth_file) / TartanAir.DEPTH_SCALE
-        valid = np.isfinite(depth)
-        depth[~valid] = 1.0
+        depth = np.load(depth_file)
+
+        sky_mask = depth >= 1000
+        depth[sky_mask] = -1.0  # sky
+        depth = np.nan_to_num(depth, nan=0, posinf=0, neginf=0)
+        threshold = (
+            np.percentile(depth[depth > 0], 98)
+            if depth[depth > 0].size > 0
+            else 0
+        )
+        depth[depth > threshold] = 0.0
+
+        valid = depth > 0
         return depth, valid
-    
+
 
 class TartanAirStream(RGBDStream):
     def __init__(self, datapath, **kwargs):

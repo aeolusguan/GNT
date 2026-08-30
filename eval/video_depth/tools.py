@@ -305,7 +305,7 @@ def depth_evaluation(
     max_ratio = torch.maximum(
         predicted_depth / ground_truth_depth, ground_truth_depth / predicted_depth
     )
-    threshold_0 = torch.mean((max_ratio < 1.0).float()).item()
+    threshold_1_03 = torch.mean((max_ratio < 1.03).float()).item()
     threshold_1 = torch.mean((max_ratio < 1.25).float()).item()
     threshold_2 = torch.mean((max_ratio < 1.25**2).float()).item()
     threshold_3 = torch.mean((max_ratio < 1.25**3).float()).item()
@@ -367,7 +367,7 @@ def depth_evaluation(
             sq_rel,
             rmse,
             log_rmse,
-            threshold_0,
+            threshold_1_03,
             threshold_1,
             threshold_2,
             threshold_3,
@@ -378,7 +378,7 @@ def depth_evaluation(
         "Sq Rel": sq_rel,
         "RMSE": rmse,
         "Log RMSE": log_rmse,
-        "δ < 1.": threshold_0,
+        "δ < 1.03": threshold_1_03,
         "δ < 1.25": threshold_1,
         "δ < 1.25^2": threshold_2,
         "δ < 1.25^3": threshold_3,

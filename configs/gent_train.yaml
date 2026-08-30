@@ -18,18 +18,26 @@ edges: 24
 data:
   tartanair:
     root: datasets/TartanAir
-    samples_per_epoch: 5000
+    samples_per_epoch: 2500
   arkitscenes:
     root: datasets/ARKitScenes_processed
     samples_per_epoch: 2500
   dynamic_replica:
     root: datasets/dynamic_replica
+    samples_per_epoch: 1250
+  point_odyssey:
+    root: /data/disk_24t/wenzhen_data/pointo_processed
+    samples_per_epoch: 1250
+  waymo:
+    root: /data/disk_24t/wenzhen_data/waymo/processed_data
     samples_per_epoch: 2500
 w_pose: 5.0
 w_flow: 0.05
 w_depth: 1.0
 w_front_flow: 1.0
 depth_valid_range: 0.98  # Drop the noisiest 2% of depth residuals.
+depth_normalization_min_cutoff: 80.0  # Always retain non-sky depths below this value.
+depth_normalization_quantile: 0.8  # Raise the cutoff to this non-sky depth quantile.
 var_min: 0.0
 var_max: 10.0
 gamma: 0.8

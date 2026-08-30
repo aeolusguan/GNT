@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 
 from gent.model import GeNTWrapper
+from gent.model.gent import build_depth_normalization_mask
 
 
 @dataclass
@@ -31,9 +32,17 @@ class GeNTMeasurements:
         *,
         device: torch.device,
         use_fp16: bool,
+        depth_normalization_min_cutoff: float,
+        depth_normalization_quantile: float,
     ) -> "GeNTMeasurements":
         net = GeNTWrapper.from_pretrained(checkpoint_path).eval().to(device)
-        return cls(net, device, use_fp16=use_fp16)
+        return cls(
+            net,
+            device,
+            use_fp16=use_fp16,
+            depth_normalization_min_cutoff=depth_normalization_min_cutoff,
+            depth_normalization_quantile=depth_normalization_quantile,
+        )
 
     def __init__(
         self,
@@ -41,10 +50,14 @@ class GeNTMeasurements:
         device: torch.device,
         *,
         use_fp16: bool,
+        depth_normalization_min_cutoff: float = 80.0,
+        depth_normalization_quantile: float = 0.8,
     ):
         self.net = net
         self.device = device
         self.use_fp16 = bool(use_fp16)
+        self.depth_normalization_min_cutoff = float(depth_normalization_min_cutoff)
+        self.depth_normalization_quantile = float(depth_normalization_quantile)
         self._unit_flow_bases: torch.Tensor | None = None
 
     @property
@@ -66,7 +79,12 @@ class GeNTMeasurements:
     ]:
         """Encode a frame into fmap, depth prior, depth token, scale, mask, and bases."""
         fmap, mono_depth, non_sky_mask = self._moge_prior(images, intrinsics)
-        normalization_mask = non_sky_mask & (mono_depth < 80)
+        normalization_mask = build_depth_normalization_mask(
+            mono_depth,
+            non_sky_mask,
+            min_cutoff=self.depth_normalization_min_cutoff,
+            quantile=self.depth_normalization_quantile,
+        )
         normed_depth, scale = self.net.normalize_depth(mono_depth, normalization_mask)
         depth_token = self.net.gnt.depth_patch_embed(
             torch.stack(
@@ -108,8 +126,7 @@ class GeNTMeasurements:
         self,
         depths: torch.Tensor,  # [1,H,W]
     ):
-        depths = depths.clamp_min(0.01)
-        disps = depths.reciprocal().unsqueeze(1)
+        disps = depths.clamp_min(0.01).reciprocal().unsqueeze(1)
         if self._unit_flow_bases is None:
             self._unit_flow_bases = self.net.flow.create_bases(torch.ones_like(disps))
 

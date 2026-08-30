@@ -7,6 +7,9 @@ from torch.utils.checkpoint import checkpoint
 from ..dinov2.layers import Block, PositionGetter
 
 
+MAX_FLOAT16_LOG_DEPTH = 11.0
+
+
 class TransformerDecoder(nn.Module):
     def __init__(
         self,
@@ -90,7 +93,9 @@ class TransformerDecoder(nn.Module):
     def _apply_activation_single(self, x: torch.Tensor, activation: str = "linear") -> torch.Tensor:
         act = activation.lower() if isinstance(activation, str) else activation
         if act == "exp":
-            return torch.exp(x)
+            # Refined depths are stored in the float16 SLAM buffer. exp(11) is
+            # about 59874, safely below the largest finite float16 value (65504).
+            return torch.exp(x.clamp_max(MAX_FLOAT16_LOG_DEPTH))
         if act == "expm1":
             return torch.expm1(x)
         if act == "expp1":

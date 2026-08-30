@@ -14,6 +14,31 @@ from .flow.core.utils import InputPadder
 from .flow import load_flow
 
 
+def build_depth_normalization_mask(
+    depth: torch.Tensor,  # [S,H,W]
+    non_sky_mask: torch.Tensor,  # [S,H,W]
+    *,
+    min_cutoff: float,
+    quantile: float,
+    valid_mask: torch.Tensor | None = None,  # [S,H,W]
+) -> torch.Tensor:
+    """Select the per-view support used to normalize a MoGe depth prior."""
+    cutoffs = []
+    for frame_depth, frame_non_sky in zip(depth, non_sky_mask, strict=True):
+        non_sky_depth = frame_depth[frame_non_sky]
+        if non_sky_depth.numel() == 0:
+            cutoff = frame_depth.new_tensor(min_cutoff)
+        else:
+            cutoff = torch.quantile(non_sky_depth, quantile).clamp_min(min_cutoff)
+        cutoffs.append(cutoff)
+
+    cutoff = torch.stack(cutoffs)[:, None, None]
+    normalization_mask = non_sky_mask & (depth <= cutoff)
+    if valid_mask is not None:
+        normalization_mask = normalization_mask & valid_mask
+    return normalization_mask
+
+
 class MotionPatchEmbed(nn.Module):
     def __init__(
         self,
@@ -325,11 +350,11 @@ class GeNTWrapper(nn.Module):
         fx = intrinsics[0, :, 0]
         fov_x = torch.rad2deg(2 * torch.atan(W / (2 * fx)))
         depth_predictions = self.mono.infer(images[0], fov_x=fov_x, apply_mask=False)
-        mono_depths = depth_predictions["depth"]
+        mono_depths = depth_predictions["depth"].clamp_min(0.01)
+        non_sky_mask = depth_predictions["mask"]
 
         # Predict target-to-reference correspondence flow for each graph edge i -> j.
-        mono_depths = mono_depths.clamp_min(0.01)
-        disps = 1.0 / mono_depths
+        disps = mono_depths.reciprocal()
         bases = self.flow.create_bases(disps.unsqueeze(1))
         mono = depth_predictions["feature"]
         
@@ -351,7 +376,8 @@ class GeNTWrapper(nn.Module):
             "init": padder.unpad(flow_predictions["init"]),
         }
 
-        return flow_predictions, depth_predictions
+        del depth_predictions
+        return flow_predictions, mono_depths, non_sky_mask
 
     def forward(
         self,
@@ -360,12 +386,12 @@ class GeNTWrapper(nn.Module):
         graph,
         gt_depth_valid: torch.Tensor,  # [1,S,H,W]
         use_fp16=False,
+        depth_normalization_min_cutoff: float = 80.0,
+        depth_normalization_quantile: float = 0.8,
     ):
-        if intrinsics.shape != (*images.shape[:2], 4):
-            raise ValueError(
-                "intrinsics must provide [fx, fy, cx, cy] for every training view; "
-                f"expected {(*images.shape[:2], 4)}, got {tuple(intrinsics.shape)}"
-            )
+        assert intrinsics.shape == (*images.shape[:2], 4), (
+            "intrinsics must provide [fx, fy, cx, cy] for every training view"
+        )
         ii, jj, _ = graph_to_edge_list(graph)
         iu_list = torch.unique(ii).tolist()
 
@@ -382,13 +408,22 @@ class GeNTWrapper(nn.Module):
         depths_conf = torch.zeros((images.shape[1], images.shape[3], images.shape[4]), device=images.device, dtype=torch.float32)
 
         # Front end
-        flow_predictions, depth_predictions = self._frontend_forward(images, intrinsics, graph)
-        mono_depths = depth_predictions["depth"]
-        non_sky_mask = depth_predictions["mask"]
+        flow_predictions, mono_depths, non_sky_mask = self._frontend_forward(
+            images,
+            intrinsics,
+            graph,
+        )
 
-        # MoGe's non-sky prediction and dataset validity define the shared
-        # training gauge. Normalized MoGe values outside it are retained.
-        normalization_mask = non_sky_mask & gt_depth_valid[0]
+        # Keep the normalization support consistent with runtime: use all
+        # non-sky pixels up to max(min_cutoff, quantile(non-sky depth)), then
+        # intersect it with the dataset-valid mask available during training.
+        normalization_mask = build_depth_normalization_mask(
+            mono_depths,
+            non_sky_mask,
+            min_cutoff=depth_normalization_min_cutoff,
+            quantile=depth_normalization_quantile,
+            valid_mask=gt_depth_valid[0],
+        )
         scaled_depth, scale = self.normalize_depth(mono_depths, normalization_mask)
 
         flow_final, info_final = flow_predictions["flow"][-1], flow_predictions["info"][-1]

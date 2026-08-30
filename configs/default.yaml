@@ -15,6 +15,8 @@ pipeline:
   slam:
     ckpt_path: ???
     intrinsics: ???  # [F, 4] per selected frame, or [4] for a fixed camera
+    depth_normalization_min_cutoff: 80.0  # Always retain non-sky depths below this value
+    depth_normalization_quantile: 0.8  # Raise the cutoff to this non-sky depth quantile
     visualize: false
     buffer: 512
     pgo_iters: 12
