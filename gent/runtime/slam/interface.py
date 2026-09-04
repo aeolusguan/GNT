@@ -73,6 +73,26 @@ class SLAMOutput:
         assert self.slam_map is not None, "SLAM map not available."
         return np.array(self.slam_map.dense_depth_frame_inds)
 
+    @property
+    def poses(self) -> torch.Tensor:
+        trajectory = self.frame_trajectory if self.frame_trajectory is not None else self.trajectory
+        return trajectory.matrix()
+
+    @property
+    def kf_idx(self) -> torch.Tensor:
+        if self.frame_trajectory is None:
+            return torch.arange(
+                self.trajectory.data.shape[0],
+                dtype=torch.long,
+                device=self.trajectory.data.device,
+            )
+        assert self.frame_timestamps is not None
+        indices = np.searchsorted(
+            np.asarray(self.frame_timestamps, dtype=np.int64),
+            self.keyframe_ids.astype(np.int64),
+        )
+        return torch.as_tensor(indices, dtype=torch.long, device=self.trajectory.data.device)
+
     def get_trajectory(self, n_frames: int | None = None):
         if self.frame_trajectory is not None:
             n = self.frame_trajectory.data.shape[0]

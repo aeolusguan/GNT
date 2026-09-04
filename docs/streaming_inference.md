@@ -43,6 +43,44 @@ metric_depth = stored_depth * scale
 
 When PGO changes a node scale, the corresponding depth is marked dirty.
 
+## Pose Evaluation
+
+`eval/slam/launch.py` builds the GeNT model and runs `SLAMSystem` directly on
+each selected sequence, following the launcher structure used by
+`eval/video_depth/launch.py`. It does not read or write pose artifacts. The
+result is evaluated with the AMB3R/evo protocol: Sim(3) alignment for
+monocular trajectories followed by translation-part APE RMSE.
+
+Dataset paths, TUM ground-truth paths, and camera intrinsics live in
+`eval/slam/metadata.py`. The evaluator converts the TUM poses and the
+`SLAMOutput` poses (whose runtime convention is fixed to w2c) to c2w before
+calling evo. `load_traj` uses the metadata `traj_format` to return GT poses in
+canonical trajectory form, and `make_traj` converts them to c2w matrices. No
+separate pose-convention field is needed. Ground-truth paths are resolved
+through `gt_traj_func(img_path, anno_path, sequence)`, following the CUT3R
+loader convention. Each sequence is evaluated on both all tracked frames and
+keyframes:
+
+The runtime result also exposes the AMB3R-compatible pair `result.poses`
+(`[F, 4, 4]`, all tracked frames) and `result.kf_idx` (keyframe indices into
+`result.poses`). The existing keyframe-aligned `trajectory`/`timestamps` and
+frame-aligned `frame_trajectory`/`frame_timestamps` fields remain available.
+
+```bash
+python eval/slam/launch.py \
+  --weights output_camera_prior/checkpoint-last.pth \
+  --eval_dataset bonn \
+  --num_iters 5
+```
+
+The sequence set is defined by the dataset metadata, and evaluation always uses
+the complete sequence with stride 1. SLAM/VO parameters are always read from
+`configs/slam_eval.yaml`. Each sequence reports both all-frame and keyframe ATE
+with monocular Sim(3) alignment, together with the AMB3R/evo statistics and
+trajectory plots. Repeated runs are stored under `iter_<n>/`, and the summary
+is written to `<output_dir>/results.json`. `evo` must be installed in the
+runtime environment.
+
 ## Camera Intrinsics
 
 Each selected video frame carries its own pinhole calibration row

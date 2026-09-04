@@ -1,6 +1,7 @@
 from .arkit import ARKitScenes
 from .dynamic_replica import DynamicReplica
 from .point_odyssey import PointOdyssey
+from .scannet import ScanNet
 from .tartan import TartanAir
 from .waymo import Waymo
 
@@ -10,6 +11,7 @@ DATASET_CLASSES = {
     "arkitscenes": ARKitScenes,
     "dynamic_replica": DynamicReplica,
     "point_odyssey": PointOdyssey,
+    "scannet": ScanNet,
     "waymo": Waymo,
 }
 

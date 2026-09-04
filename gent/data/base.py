@@ -13,6 +13,14 @@ from .rgbd_utils import compute_sparse_distance_matrix_flow
 
 
 DATASET_CACHE_DIR = osp.join(osp.dirname(osp.abspath(__file__)), "cache")
+DEFAULT_RESOLUTIONS = (
+    (384, 512),
+    (336, 512),
+    (288, 512),
+    (256, 512),
+    (208, 512),
+    (160, 512),
+)
 
 
 class RGBDDataset(EasyDataset):
@@ -21,22 +29,46 @@ class RGBDDataset(EasyDataset):
         name,
         datapath,
         n_frames=4,
-        crop_size=(384, 512),
+        resolutions=DEFAULT_RESOLUTIONS,
+        aug_crop=16,
+        seq_aug_crop=False,
+        color_jitter=True,
         fmin=8.0,
         fmax=75.0,
         do_aug=True,
     ):
-        """Base class for RGB-D training datasets."""
-        self.aug = None
+        """Base class for RGB-D training datasets.
+
+        The sampler passes ``(sample_index, resolution_index)`` so every
+        batch can use one common spatial resolution.
+        """
         self.root = datapath
         self.name = name
+
+        self._resolutions = tuple(tuple(resolution) for resolution in resolutions)
+        assert self._resolutions
+        assert all(
+            height % 16 == 0 and width % 16 == 0
+            for height, width in self._resolutions
+        )
+        assert do_aug or len(self._resolutions) == 1
+        self.augs = (
+            tuple(
+                RGBDAugmentor(
+                    crop_size=resolution,
+                    aug_crop=aug_crop,
+                    seq_aug_crop=seq_aug_crop,
+                    color_jitter=color_jitter,
+                )
+                for resolution in self._resolutions
+            )
+            if do_aug
+            else ()
+        )
 
         self.n_frames = n_frames
         self.fmin = fmin
         self.fmax = fmax
-
-        if do_aug:
-            self.aug = RGBDAugmentor(crop_size=crop_size)
 
         os.makedirs(DATASET_CACHE_DIR, exist_ok=True)
         cache_path = osp.join(DATASET_CACHE_DIR, f"{self.name}.pickle")
@@ -159,7 +191,12 @@ class RGBDDataset(EasyDataset):
     def __getitem__(self, index):
         """Return one sampled training video."""
 
-        index = index % len(self.dataset_index)
+        resolution_idx = 0
+        if isinstance(index, tuple):
+            index, resolution_idx = index
+            resolution_idx = int(resolution_idx)
+            assert 0 <= resolution_idx < len(self._resolutions)
+        index = int(index) % len(self.dataset_index)
         scene_id, ix = self.dataset_index[index]
 
         scene_info = self.scene_info[scene_id]
@@ -182,11 +219,19 @@ class RGBDDataset(EasyDataset):
             poses.append(scene_info["poses"][i])
             intrinsics.append(scene_info["intrinsics"][i])
 
-        images = np.stack(images).astype(np.float32)
+        images = np.stack(images)
         depths = np.stack(depths).astype(np.float32)
         depths_valid = np.stack(depths_valid).astype(np.bool_)
         poses = np.stack(poses).astype(np.float32)
         intrinsics = np.stack(intrinsics).astype(np.float32)
+
+        if self.augs:
+            images, depths, depths_valid, intrinsics = self.augs[resolution_idx](
+                images,
+                depths,
+                depths_valid,
+                intrinsics,
+            )
 
         images = torch.from_numpy(images).float()
         images = images.permute(0, 3, 1, 2)
@@ -195,15 +240,6 @@ class RGBDDataset(EasyDataset):
         depths_valid = torch.from_numpy(depths_valid)
         poses = torch.from_numpy(poses)
         intrinsics = torch.from_numpy(intrinsics)
-
-        if self.aug is not None:
-            images, poses, depths, depths_valid, intrinsics = self.aug(
-                images,
-                poses,
-                depths,
-                depths_valid,
-                intrinsics,
-            )
 
         return images, poses, depths, depths_valid, intrinsics
 

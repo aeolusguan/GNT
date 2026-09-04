@@ -142,6 +142,10 @@ def train(args):
     db = dataset_factory(
         args.data,
         n_frames=args.n_frames,
+        resolutions=args.train_resolutions,
+        aug_crop=args.train_aug_crop,
+        seq_aug_crop=args.train_seq_aug_crop,
+        color_jitter=args.train_color_jitter,
         fmin=args.fmin,
         fmax=args.fmax,
     )

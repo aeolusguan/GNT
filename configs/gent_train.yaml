@@ -15,6 +15,19 @@ disable_cudnn_benchmark: false
 resume: null
 n_frames: 7
 edges: 24
+# [height, width], rounded to patch-16 multiples from CUT3R's
+# (518, 392), (518, 336), (518, 294), (518, 266), (518, 210), (518, 154).
+# The sampler uses probabilities [2/9, 2/9, 2/9, 1/9, 1/9, 1/9].
+train_resolutions:
+  - [384, 512]
+  - [336, 512]
+  - [288, 512]
+  - [256, 512]
+  - [208, 512]
+  - [160, 512]
+train_aug_crop: 16
+train_seq_aug_crop: false  # CUT3R samples the crop enlargement independently per view.
+train_color_jitter: true   # Jitter parameters and operation order are shared by the sequence.
 data:
   tartanair:
     root: datasets/TartanAir
@@ -28,6 +41,9 @@ data:
   point_odyssey:
     root: /data/disk_24t/wenzhen_data/pointo_processed
     samples_per_epoch: 1250
+  scannet:
+    root: datasets/ScanNet_processed
+    samples_per_epoch: 2500
   waymo:
     root: /data/disk_24t/wenzhen_data/waymo/processed_data
     samples_per_epoch: 2500

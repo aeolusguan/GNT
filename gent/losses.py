@@ -32,9 +32,18 @@ def normalize_depth(
     valid: torch.Tensor,  # [B,H,W]
     eps=1e-8,
 ):
-    masked_depth, nnz = invalid_to_zeros(depth, valid)
-    scale_factor = masked_depth.flatten(1).sum(dim=1) / (nnz + eps)
-    scale_factor = scale_factor.clip(min=1e-8)
+    finite_positive = torch.isfinite(depth) & (depth > eps)
+    valid = valid & finite_positive
+    nnz = valid.flatten(1).sum(dim=1)
+    masked_depth = torch.where(valid, depth, torch.zeros_like(depth))
+    masked_mean = masked_depth.flatten(1).sum(dim=1) / nnz.clamp_min(1)
+
+    # A frame with no selected support still has usable finite-positive depth;
+    # use its median for normalization. Such a frame is excluded from losses
+    # by MultitaskLoss.forward below.
+    frame_depth = depth.masked_fill(~finite_positive, float("nan"))
+    fallback_median = torch.nanmedian(frame_depth.flatten(1), dim=1).values
+    scale_factor = torch.where(nnz > 0, masked_mean, fallback_median).clamp_min(eps)
     return depth / scale_factor[:, None, None], scale_factor
 
 
@@ -43,6 +52,7 @@ def camera_loss(
     gt_pose_enc: torch.Tensor,  # [...,7]
     loss_type="l1",
     conf: torch.Tensor | None = None,  # [...,2]
+    translation_valid: torch.Tensor | None = None,  # [...]
 ):
     """
     Compute translation, rotation for a batch of pose encodings.
@@ -50,6 +60,8 @@ def camera_loss(
     Args:
         loss_type: "l1" (abs error) or "l2" (euclidean error)
         conf: predicted confidence for the 6D pose residual.
+        translation_valid: edge mask for translation loss; rotation remains
+            supervised on all edges.
     Returns:
         loss_T: mean translation loss
         loss_R: mean rotation loss
@@ -82,7 +94,12 @@ def camera_loss(
         loss_T = loss_T * conf[..., 0] - 0.01 * torch.log(conf[..., 0])
         loss_R = loss_R * conf[..., 1] - 0.05 * torch.log(conf[..., 1])
 
-    return loss_T.mean(), loss_R.mean()
+    if translation_valid is None:
+        translation_loss = loss_T.mean()
+    else:
+        translation_valid = translation_valid.to(loss_T.dtype)
+        translation_loss = (loss_T * translation_valid).sum() / translation_valid.sum().clamp_min(1)
+    return translation_loss, loss_R.mean()
 
 
 @dataclass(eq=False)
@@ -113,9 +130,12 @@ class MultitaskLoss(torch.nn.Module):
         pr_scale_confidence = edge_measurements[..., 10]
         gt_depth = batch["depth"]
         # The MoGe non-sky mask and dataset validity jointly define the shared
-        # normalized-depth gauge. Dataset-valid pixels remain supervised.
+        # normalized-depth gauge. A frame with no normalization support still
+        # gets a median scale, but contributes no normalized-depth supervision.
         normalization_mask = predictions["normalization_mask"]
         valid_mask = batch["valid"]
+        frame_has_support = normalization_mask.flatten(2).any(dim=2)
+        normalized_depth_valid = valid_mask & frame_has_support[:, :, None, None]
         gt_disps = torch.where(
             valid_mask,
             gt_depth.reciprocal(),
@@ -127,6 +147,14 @@ class MultitaskLoss(torch.nn.Module):
             normalization_mask.flatten(0, 1),
         )
         gt_scale = gt_scale.view(*gt_depth.shape[:2])  # [B,S]
+        # Zero marks frames whose normalization support is empty. The median
+        # scale was still used to build gt_depth_target, but translation and
+        # relative-scale losses skip edges touching these frames.
+        gt_scale = torch.where(
+            frame_has_support,
+            gt_scale,
+            torch.zeros_like(gt_scale),
+        )
         gt_depth_target = gt_depth_target.view(*gt_depth.shape)  # [B,S,H,W]
         gt_depth_target = torch.where(
             valid_mask,
@@ -160,7 +188,12 @@ class MultitaskLoss(torch.nn.Module):
             args=self.args,
         )
         flo_loss = sanitize_loss(flo_loss)
-        depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(pr_depth, gt_depth_target, pr_depth_conf, valid_mask)
+        depth_conf_loss, depth_grad_loss, depth_reg_loss = self.compute_depth_loss(
+            pr_depth,
+            gt_depth_target,
+            pr_depth_conf,
+            normalized_depth_valid,
+        )
         depth_loss = depth_grad_loss + depth_conf_loss
         depth_metrics = {
             'depth_reg': depth_reg_loss.detach(),
@@ -188,35 +221,43 @@ class MultitaskLoss(torch.nn.Module):
     ):
         # relative pose
         ii, jj, _ = graph_to_edge_list(graph)
+        frame_valid = gt_scale > 0
+        edge_valid = frame_valid[:, ii] & frame_valid[:, jj]
+        safe_gt_scale = torch.where(frame_valid, gt_scale, torch.ones_like(gt_scale))
         dP = gt_pose[:,jj] * gt_pose[:,ii].inv()
 
         # gt_scale[:, ii]: [B,E], one source depth scale per relative edge.
         # GT relative translation is supervised in the source normalized-depth gauge.
         # Predictions are already expected to live in this gauge.
-        dP = dP.scale(1.0 / gt_scale[:, ii])
+        dP = dP.scale(1.0 / safe_gt_scale[:, ii])
 
         loss_T, loss_R = camera_loss(
             pr_rel_poses.data,
             dP.data,
             conf=pr_rel_pose_log_variance,
+            translation_valid=edge_valid,
         )
-        gt_relative_log_scale = torch.log(gt_scale[:, jj]) - torch.log(gt_scale[:, ii])
+        gt_relative_log_scale = torch.log(safe_gt_scale[:, jj]) - torch.log(safe_gt_scale[:, ii])
         scale_residual = (pr_relative_log_scale - gt_relative_log_scale).abs()
         scale_residual = sanitize_loss(scale_residual)
         scale_loss = scale_residual * pr_scale_confidence - 0.02 * torch.log(pr_scale_confidence)
-        scale_loss = sanitize_loss(scale_loss).mean()
+        scale_loss = sanitize_loss(scale_loss)
+        edge_weight = edge_valid.to(scale_loss.dtype)
+        scale_loss = (scale_loss * edge_weight).sum() / edge_weight.sum().clamp_min(1)
         cam_loss = loss_T + loss_R + scale_loss
 
         dE = Sim3(pr_rel_poses * dP.inv()).detach()
         r_err, t_err, _ = pose_metrics(dE)
         scale_error = scale_residual.detach()
+        metric_weight = edge_valid.to(t_err.dtype)
+        metric_count = metric_weight.sum().clamp_min(1)
 
         metrics = {
             'rot_error': r_err.mean(),
-            'tr_error': t_err.mean(),
-            'scale_error': scale_error.mean(),
+            'tr_error': (t_err * metric_weight).sum() / metric_count,
+            'scale_error': (scale_error * metric_weight).sum() / metric_count,
             'bad_rot': (r_err < .1).float().mean(),
-            'bad_tr': (t_err < .01).float().mean(),
+            'bad_tr': (((t_err < .01).float()) * metric_weight).sum() / metric_count,
         }
 
         return cam_loss, metrics

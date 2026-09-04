@@ -314,11 +314,18 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
 
     slam_output = pipeline.run(stream).payload
     assert slam_output is not None
-    if slam_output.frame_trajectory is None or slam_output.frame_timestamps is None:
-        raise RuntimeError("SLAMOutput must provide every-frame trajectory for pose evaluation.")
     gt_poses_all = _load_gt_poses(scene_dir)
-    est_poses = slam_output.frame_trajectory.data.detach().cpu().numpy()
-    pose_ids = int(cfg.frame_start) + slam_output.frame_timestamps.astype(np.int64) * int(cfg.frame_skip)
+    pose_source = str(cfg.pose_source)
+    if pose_source == "frame":
+        if slam_output.frame_trajectory is None or slam_output.frame_timestamps is None:
+            raise RuntimeError("SLAMOutput must provide frame trajectory for frame pose evaluation.")
+        est_poses = slam_output.frame_trajectory.data.detach().cpu().numpy()
+        pose_ids = int(cfg.frame_start) + slam_output.frame_timestamps.astype(np.int64) * int(cfg.frame_skip)
+    elif pose_source == "keyframes":
+        est_poses = slam_output.trajectory.data.detach().cpu().numpy()
+        pose_ids = int(cfg.frame_start) + slam_output.keyframe_ids.astype(np.int64) * int(cfg.frame_skip)
+    else:
+        raise ValueError(f"unsupported pose_source: {pose_source}")
     keyframe_ids = int(cfg.frame_start) + slam_output.keyframe_ids.astype(np.int64) * int(cfg.frame_skip)
     gt_poses = gt_poses_all[pose_ids]
 
@@ -334,6 +341,7 @@ def _run_scene(cfg: DictConfig, split_scene: str, scene_dir: Path, scene_index: 
             "resolved_scene": str(scene_dir),
             "frames": int(len(stream)),
             "keyframes": int(slam_output.trajectory.data.shape[0]),
+            "pose_source": pose_source,
             "first_frame": int(cfg.frame_start),
             "frame_skip": int(cfg.frame_skip),
             "edge_count": int((slam_output.pose_edges or {}).get("ii", torch.empty(0)).numel()),

@@ -8,6 +8,7 @@ max_scenes: 0
 frame_start: 0
 frame_end: 80
 frame_skip: 1
+pose_source: frame
 intrinsics: [320.0, 320.0, 320.0, 240.0]
 
 slam:

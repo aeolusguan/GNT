@@ -52,7 +52,16 @@ class BatchedRandomSampler:
 
         # random feat_idxs (same across each batch)
         n_batches = (self.total_size+self.batch_size-1) // self.batch_size
-        feat_idxs = rng.integers(self.pool_size, size=n_batches)
+        # Match CUT3R's resolution sampler: the first half of the pool is
+        # sampled twice as often as the second half.
+        feat_probabilities = np.ones(self.pool_size, dtype=np.float64)
+        feat_probabilities[: self.pool_size // 2] *= 2.0
+        feat_probabilities /= feat_probabilities.sum()
+        feat_idxs = rng.choice(
+            self.pool_size,
+            size=n_batches,
+            p=feat_probabilities,
+        )
         feat_idxs = np.broadcast_to(feat_idxs[:, None], (n_batches, self.batch_size))
         feat_idxs = feat_idxs.ravel()[:self.total_size]
 

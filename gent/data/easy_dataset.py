@@ -34,8 +34,15 @@ class EasyDataset:
     def make_sampler(self, batch_size, shuffle=True, world_size=1, rank=0, drop_last=True):
         if not (shuffle):
             raise NotImplementedError()  # cannot deal yet
-        num_of_aspect_ratios = len(self._resolutions)
-        return BatchedRandomSampler(self, batch_size, num_of_aspect_ratios, world_size=world_size, rank=rank, drop_last=drop_last)
+        num_of_resolutions = len(self._resolutions)
+        return BatchedRandomSampler(
+            self,
+            batch_size,
+            num_of_resolutions,
+            world_size=world_size,
+            rank=rank,
+            drop_last=drop_last,
+        )
     
 
 class MulDataset(EasyDataset):

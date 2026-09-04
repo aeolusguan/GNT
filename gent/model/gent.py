@@ -23,9 +23,12 @@ def build_depth_normalization_mask(
     valid_mask: torch.Tensor | None = None,  # [S,H,W]
 ) -> torch.Tensor:
     """Select the per-view support used to normalize a MoGe depth prior."""
+    finite_positive = torch.isfinite(depth) & (depth > 0)
+    non_sky_support = non_sky_mask & finite_positive
     cutoffs = []
     for frame_depth, frame_non_sky in zip(depth, non_sky_mask, strict=True):
-        non_sky_depth = frame_depth[frame_non_sky]
+        frame_support = frame_non_sky & torch.isfinite(frame_depth) & (frame_depth > 0)
+        non_sky_depth = frame_depth[frame_support]
         if non_sky_depth.numel() == 0:
             cutoff = frame_depth.new_tensor(min_cutoff)
         else:
@@ -33,7 +36,7 @@ def build_depth_normalization_mask(
         cutoffs.append(cutoff)
 
     cutoff = torch.stack(cutoffs)[:, None, None]
-    normalization_mask = non_sky_mask & (depth <= cutoff)
+    normalization_mask = non_sky_support & (depth <= cutoff)
     if valid_mask is not None:
         normalization_mask = normalization_mask & valid_mask
     return normalization_mask
@@ -319,17 +322,17 @@ class GeNTWrapper(nn.Module):
         mask: torch.Tensor,  # [B,H,W]
         eps=1e-8,
     ):
-        masked_depth = depth.masked_fill(~mask, 0)
+        finite_positive = torch.isfinite(depth) & (depth > eps)
+        mask = mask & finite_positive
         valid_count = mask.flatten(1).sum(dim=1)
-        valid_scale = valid_count > 0
-        scale = masked_depth.flatten(1).sum(dim=1) / valid_count.clamp_min(1)
-        scale = torch.where(valid_scale, scale + eps, torch.zeros_like(scale))
-        fallback_scale = torch.where(
-            valid_scale.any(),
-            scale.sum() / valid_scale.sum().clamp_min(1),
-            scale.new_tensor(1.0),
-        )
-        scale = torch.where(valid_scale, scale, fallback_scale)
+        masked_depth = torch.where(mask, depth, torch.zeros_like(depth))
+        masked_mean = masked_depth.flatten(1).sum(dim=1) / valid_count.clamp_min(1)
+
+        # Every frame is expected to contain usable depth. If the selected
+        # support is empty, use that frame's finite-positive depth median.
+        frame_depth = depth.masked_fill(~finite_positive, float("nan"))
+        fallback_median = torch.nanmedian(frame_depth.flatten(1), dim=1).values
+        scale = torch.where(valid_count > 0, masked_mean + eps, fallback_median)
         return depth / scale[:, None, None], scale
 
     def _frontend_forward(
